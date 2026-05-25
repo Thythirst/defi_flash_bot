@@ -1,0 +1,22 @@
+2026-05-21 11:57:00,557 | INFO     | liquidation_backtest | Fetching 557 liquidation chunks (1.1M blocks) ...
+2026-05-21 11:58:00,704 | INFO     | liquidation_backtest | Fetched 11 liquidation events
+2026-05-21 11:58:00,705 | INFO     | liquidation_backtest | Simulation complete.
+
+======================================================================
+ AAVE v3 LIQUIDATION BACKTEST SUMMARY
+======================================================================
+  atoken_liquidations_skipped              2
+  profitable_events                        7
+  total_events                             11
+  total_net_profit                         39789797624152968973
+  unprofitable_events                      2
+
+  Total events simulated:     9
+  Profitable:               7 (77.8%)
+  Total net profit (wei):   39789797624152968973
+  Avg net profit (wei):     5684256803450424320
+  Best single liquidation:  block=464200724 net=37592173652921589760 wei
+======================================================================
+
+2026-05-21 11:58:00,706 | INFO     | liquidation_backtest | CSV saved to liquidation_backtest.csv
+2026-05-21 11:58:00,706 | INFO     | liquidation_backtest | JSON saved to liquidation_backtest.json

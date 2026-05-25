@@ -1,0 +1,175 @@
+# ═══════════════════════════════════════════════════════════════════════════════
+# pairs.yaml — Arbitrum Mainnet: V3 Cross-Fee-Tier + Cross-DEX Spatial Matrix
+# ═══════════════════════════════════════════════════════════════════════════════
+#
+#  ⚠️  ADDRESS VERIFICATION STATUS (May 2026, on-chain via Alchemy archive RPC)
+#  ───────────────────────────────────────────────────────────────────────────
+#  • Uni V3 WETH/USDC 500  : 0xC6962004f452bE9203591991D15f6b388e09E8D0 ✅
+#  • Uni V3 WETH/USDC 3000 : 0xC473e2Aee3441BF9240bE85EB122ABB059a3B57C ✅
+#  • Uni V3 WETH/ARB  500  : 0xC6f780497A95E246EB9449F5E4770916DCd6396A ✅
+#  • Uni V3 WETH/ARB  3000 : 0x92c63d0e701CaAE670c9415d91C474f686298f00 ✅
+#  • Sushi V3 WETH/USDC 500: 0xf3eb87c1f6020982173c908e7eb31aa66c1f0296 ✅
+#  • Sushi V3 WETH/ARB 500: 0x99543bf98ca1830aa20d3eb12c1b9962f8eadc11 ✅
+#  • Camelot V3 WETH/USDC  : NOT FOUND — factory 0x1a3c9B… has NO CODE on Arbitrum ⚠️
+#  • SushiSwap V2 WETH/ARB : factory returns address but NO CODE deployed ⚠️
+#
+#  The previous deterministic CREATE2 computation used an incorrect initCodeHash
+#  for Arbitrum, producing addresses that do not exist on-chain.  ALL addresses
+#  have been replaced with factory-verified outputs from live eth_call.
+# ═══════════════════════════════════════════════════════════════════════════════
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Global RPC & fetcher tuning (free-tier Alchemy)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+rpc:
+  http_url: "${ALCHEMY_HTTP_URL}"
+  wss_url:  "${ALCHEMY_WSS_URL}"
+  chain_id: 42161
+
+  fetcher:
+    chunk_size: 2000
+    max_concurrent_requests: 3
+    request_delay_ms: 250
+    max_retries: 3
+    backoff_base_ms: 250
+    cache_dir: "~/.defi_flash_bot/cache"
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Canonical token registry (Arbitrum Mainnet)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+tokens:
+  WETH:
+    address: "0x82af49447d8a07e3bd95bd0d56f35241523fbab1"
+    decimals: 18
+
+  USDC:
+    address: "0xaf88d065e77c8cC2239327C5EDb3A432268e5831"
+    decimals: 6
+
+  ARB:
+    address: "0x912CE59144191C1204E64559FE8253a0e49E6548"
+    decimals: 18
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Factory contracts
+# ═══════════════════════════════════════════════════════════════════════════════
+
+factories:
+  uniswap_v3:
+    address: "0x1F98431c8aD98523631AE4a59f267346ea31F984"
+
+  sushiswap_v3:
+    address: "0x1af415a1EbA07a4986a52B6f2e7dE7003d82231e"
+
+  camelot_v3_algebra:
+    address: null
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Strategy definitions
+# ═══════════════════════════════════════════════════════════════════════════════
+
+strategies:
+
+  WETH_USDC_CROSS_FEE:
+    enabled: true
+    pair: [WETH, USDC]
+    loan_size_wei: "5000000000000000000"
+    min_profit_threshold_wei: "0"
+    slippage_tolerance_bps: 50
+    flash_loan_premium_bps: 5
+    pools:
+      - name: "univ3_weth_usdc_500"
+        dex: uniswap_v3
+        type: concentrated_v3
+        address: "0xC6962004f452bE9203591991D15f6b388e09E8D0"
+        fee_tier: 500
+        tick_spacing: 10
+        token0: WETH
+        token1: USDC
+        direction_for_swap0: true
+      - name: "univ3_weth_usdc_3000"
+        dex: uniswap_v3
+        type: concentrated_v3
+        address: "0xC473e2Aee3441BF9240bE85EB122ABB059a3B57C"
+        fee_tier: 3000
+        tick_spacing: 60
+        token0: WETH
+        token1: USDC
+        direction_for_swap0: false
+    execution: sequential_leg
+    max_tick_cross_allowed: 0
+    math_module: scanner.v3_math
+
+  WETH_ARB_CROSS_FEE:
+    enabled: true
+    pair: [WETH, ARB]
+    loan_size_wei: "500000000000000000"
+    min_profit_threshold_wei: "0"
+    slippage_tolerance_bps: 75
+    flash_loan_premium_bps: 5
+    pools:
+      - name: "univ3_weth_arb_500"
+        dex: uniswap_v3
+        type: concentrated_v3
+        address: "0xC6f780497A95E246EB9449F5E4770916DCd6396A"
+        fee_tier: 500
+        tick_spacing: 10
+        token0: WETH
+        token1: ARB
+        direction_for_swap0: true
+      - name: "univ3_weth_arb_3000"
+        dex: uniswap_v3
+        type: concentrated_v3
+        address: "0x92c63d0e701CaAE670c9415d91C474f686298f00"
+        fee_tier: 3000
+        tick_spacing: 60
+        token0: WETH
+        token1: ARB
+        direction_for_swap0: false
+    execution: sequential_leg
+    max_tick_cross_allowed: 0
+    math_module: scanner.v3_math
+
+  WETH_USDC_SUSHI_V3_SPATIAL:
+    enabled: true
+    pair: [WETH, USDC]
+    loan_size_wei: "5000000000000000000"
+    min_profit_threshold_wei: "0"
+    slippage_tolerance_bps: 50
+    flash_loan_premium_bps: 5
+    pools:
+      - name: "sushiswap_v3_weth_usdc_500"
+        dex: sushiswap_v3
+        type: concentrated_v3
+        address: "0xf3eb87c1f6020982173c908e7eb31aa66c1f0296"
+        fee_tier: 500
+        tick_spacing: 10
+        token0: WETH
+        token1: USDC
+        direction_for_swap0: true
+      - name: "univ3_weth_usdc_500"
+        dex: uniswap_v3
+        type: concentrated_v3
+        address: "0xC6962004f452bE9203591991D15f6b388e09E8D0"
+        fee_tier: 500
+        tick_spacing: 10
+        token0: WETH
+        token1: USDC
+        direction_for_swap0: false
+    execution: sequential_leg
+    max_tick_cross_allowed: 0
+    math_module: scanner.v3_math
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Backtest window defaults
+# ═══════════════════════════════════════════════════════════════════════════════
+
+backtest:
+  from_block: 464995000
+  to_block:   464996000
+  event_signatures:
+    v3_swap: "0xc42079f94a6350d7e6235f29174924f928cc2ac818eb64fed8004e115fbcca67"
+  blocks_per_batch: 2000
+  log_batch_size: 500
