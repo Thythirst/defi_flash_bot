@@ -27,7 +27,7 @@ import time
 from pathlib import Path
 from typing import Dict, Optional
 
-from web3 import AsyncWeb3
+from web3 import AsyncWeb3, Web3
 from dotenv import load_dotenv
 
 # Project paths
@@ -187,7 +187,7 @@ DECIMALS: Dict[str, int] = {
 
 # Aave V3 oracle on Arbitrum — used to price assets not covered by our Chainlink feeds
 # (weETH, rsETH, ezETH, rETH, LUSD, GHO, native USDC, FRAX, AAVE, tBTC, MAI, eUSD)
-AAVE_ORACLE_ADDR = "0xb56c2F0B653B2e0b10C9b928C8580Ac5Df02C7C7"
+AAVE_ORACLE_ADDR = Web3.to_checksum_address("0xb56c2F0B653B2e0b10C9b928C8580Ac5Df02C7C7")
 AAVE_ORACLE_ASSETS = [
     "0xaf88d065e77c8cC2239327C5EDb3A432268e5831",  # USDC (native) — same as USDC.e price
     "0x35751007a407ca6FEFfE80b3cB397736D2cf4dbe",  # weETH
@@ -663,7 +663,6 @@ class LiquidationPipelineV3:
         Uses rpc_light (PublicNode) — single eth_call per asset, low frequency.
         """
         from eth_abi import decode as abi_decode
-        oracle = Web3.to_checksum_address(AAVE_ORACLE_ADDR)
 
         while True:
             try:
@@ -674,7 +673,7 @@ class LiquidationPipelineV3:
                             ["address"], [asset_addr]
                         )
                         result = await self.rpc_light.w3.eth.call(
-                            {"to": oracle, "data": calldata}
+                            {"to": AAVE_ORACLE_ADDR, "data": calldata}
                         )
                         price = abi_decode(["uint256"], result)[0]
                         if price > 0:
