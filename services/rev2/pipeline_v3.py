@@ -356,7 +356,6 @@ class LiquidationPipelineV3:
         # Prime reserves for pre-warm targets — refresh_hot populates per-asset breakdown
         hot_count = await self.loader.refresh_hot(hf_threshold=1.2)
         logger.info(f"  PositionLoader: {hot_count} positions below HF 1.2 (reserves primed)")
-        self._sync_hf_engine()  # populate LocalHFEngine with primed per-asset data
 
         # ── W11: Collateral selector ────────────────────────
         self.selector = CollateralSelector(
