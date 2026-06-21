@@ -493,7 +493,7 @@ class PositionLoader:
                 self._positions[addr].reserves = user_reserves
                 self._positions[addr].last_updated = time.time()
 
-            await asyncio.sleep(0)
+            await asyncio.sleep(0.5)   # 0.5s gap between addresses ≈ 2 req/s sustained
 
     async def _fetch_reserves_list(self) -> None:
         """Fetch the Aave V3 reserve asset list once at bootstrap."""

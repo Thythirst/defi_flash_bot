@@ -982,11 +982,14 @@ class LiquidationPipelineV3:
                 if self.compound is not None:
                     await self.compound.on_new_block(current)
 
-                # Two-tier position refresh: critical (HF<1.05) every 5 blocks, broader (HF<1.20) every 20
-                if current % 5 == 0:
-                    await self.loader.refresh_hot(hf_threshold=1.15)   # critical only
-                if current % 20 == 0:
-                    await self.loader.refresh_hot(hf_threshold=1.20)   # broader set
+                # Three-tier position refresh — tuned for free-tier RPC rate limits
+                # (Arbitrum ~250ms/block: 30 blocks≈7.5s, 120 blocks≈30s, 400 blocks≈100s)
+                if current % 30 == 0:
+                    await self.loader.refresh_hot(hf_threshold=1.05)   # imminent only: ~2 req/s
+                if current % 120 == 0:
+                    await self.loader.refresh_hot(hf_threshold=1.15)   # near: ~0.5 req/s
+                if current % 400 == 0:
+                    await self.loader.refresh_hot(hf_threshold=1.20)   # broad: ~0.15 req/s
                     self._sync_hf_engine()
                     # HFChangeDetector: trigger rebuilds on fast HF drops
                     for addr, pos in self.loader._positions.items():
