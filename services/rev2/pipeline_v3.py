@@ -165,16 +165,41 @@ FEED_TO_ASSET = {k.lower(): v for k, v in CHAINLINK_FEEDS.items()}
 
 # ── Token decimals ────────────────────────────────────────────
 DECIMALS: Dict[str, int] = {
-    "0x82aF49447D8a07e3bd95BD0d56f35241523fBab1": 18,
-    "0x2f2a2543B76A4166549F7aaB2e75Bef0aefC5B0f": 8,
-    "0xFF970A61A04b1cA14834A43f5dE4533eBDDB5CC8": 6,
-    "0xaf88d065e77c8cC2239327C5EDb3A432268e5831": 6,
-    "0xFd086bC7CD5C481DCC9C85ebE478A1C0b69FCbb9": 6,
-    "0xDA10009cBd5D07dd0CeCc66161FC93D7c9000da1": 18,
-    "0x5979D7b546E38E414F7E9822514be443A4800529": 18,
-    "0x912CE59144191C1204E64559FE8253a0e49E6548": 18,
-    "0xf97f4df75117a78c1A5a0DBb814Af92458539FB4": 18,
+    "0x82aF49447D8a07e3bd95BD0d56f35241523fBab1": 18,   # WETH
+    "0x2f2a2543B76A4166549F7aaB2e75Bef0aefC5B0f": 8,    # WBTC
+    "0xFF970A61A04b1cA14834A43f5dE4533eBDDB5CC8": 6,    # USDC.e
+    "0xaf88d065e77c8cC2239327C5EDb3A432268e5831": 6,    # USDC (native)
+    "0xFd086bC7CD5C481DCC9C85ebE478A1C0b69FCbb9": 6,    # USDT
+    "0xDA10009cBd5D07dd0CeCc66161FC93D7c9000da1": 18,   # DAI
+    "0x5979D7b546E38E414F7E9822514be443A4800529": 18,   # wstETH
+    "0x912CE59144191C1204E64559FE8253a0e49E6548": 18,   # ARB
+    "0xf97f4df75117a78c1A5a0DBb814Af92458539FB4": 18,   # LINK
+    "0xba5DdD1f9d7F570dc94a51479a000E3BCE967196": 18,   # AAVE
+    "0xEC70Dcb4A1EFa46b8F2D97C310C9c4790ba5ffA8": 18,   # rETH
+    "0x93b346b6BC2548dA6A1E7d98E9a421B42541425b": 18,   # LUSD
+    "0x17FC002b466eEc40DaE837Fc4bE5c67993ddBd6F": 18,   # FRAX
+    "0x35751007a407ca6FEFfE80b3cB397736D2cf4dbe": 18,   # weETH
+    "0x7dfF72693f6A4149b17e7C6314655f6A9F7c8B33": 18,   # GHO
+    "0x2416092f143378750bb29b79eD961ab195CcEea5": 18,   # ezETH
+    "0x4186BFC76E2E237523CBC30FD220FE055156b41F": 18,   # rsETH
+    "0x6c84a8f1c29108F47a79964b5Fe888D4f4D0dE40": 8,    # tBTC
 }
+
+# Aave V3 oracle on Arbitrum — used to price assets not covered by our Chainlink feeds
+# (weETH, rsETH, ezETH, rETH, LUSD, GHO, native USDC, FRAX, AAVE, tBTC, MAI, eUSD)
+AAVE_ORACLE_ADDR = "0xb56c2F0B653B2e0b10C9b928C8580Ac5Df02C7C7"
+AAVE_ORACLE_ASSETS = [
+    "0xaf88d065e77c8cC2239327C5EDb3A432268e5831",  # USDC (native) — same as USDC.e price
+    "0x35751007a407ca6FEFfE80b3cB397736D2cf4dbe",  # weETH
+    "0xEC70Dcb4A1EFa46b8F2D97C310C9c4790ba5ffA8",  # rETH
+    "0x93b346b6BC2548dA6A1E7d98E9a421B42541425b",  # LUSD
+    "0x2416092f143378750bb29b79eD961ab195CcEea5",  # ezETH
+    "0x4186BFC76E2E237523CBC30FD220FE055156b41F",  # rsETH
+    "0x7dfF72693f6A4149b17e7C6314655f6A9F7c8B33",  # GHO
+    "0xba5DdD1f9d7F570dc94a51479a000E3BCE967196",  # AAVE
+    "0x6c84a8f1c29108F47a79964b5Fe888D4f4D0dE40",  # tBTC
+]
+AAVE_ORACLE_GET_PRICE_SEL = bytes.fromhex("b3596f07")  # getAssetPrice(address)
 
 # Asset address → symbol (for logging)
 ASSET_SYMBOLS: Dict[str, str] = {
@@ -188,6 +213,13 @@ ASSET_SYMBOLS: Dict[str, str] = {
     "0x35751007a407ca6FEFfE80b3cB397736D2cf4dbe": "weETH",
     "0x912CE59144191C1204E64559FE8253a0e49E6548": "ARB",
     "0xf97f4df75117a78c1A5a0DBb814Af92458539FB4": "LINK",
+    "0xEC70Dcb4A1EFa46b8F2D97C310C9c4790ba5ffA8": "rETH",
+    "0x93b346b6BC2548dA6A1E7d98E9a421B42541425b": "LUSD",
+    "0x2416092f143378750bb29b79eD961ab195CcEea5": "ezETH",
+    "0x4186BFC76E2E237523CBC30FD220FE055156b41F": "rsETH",
+    "0x7dfF72693f6A4149b17e7C6314655f6A9F7c8B33": "GHO",
+    "0xba5DdD1f9d7F570dc94a51479a000E3BCE967196": "AAVE",
+    "0x6c84a8f1c29108F47a79964b5Fe888D4f4D0dE40": "tBTC",
 }
 
 ERC20_ABI = [{
@@ -503,6 +535,7 @@ class LiquidationPipelineV3:
             asyncio.create_task(self._block_watch_loop(), name="block_watch"),
             asyncio.create_task(self._wallet_balance_loop(), name="wallet"),
             asyncio.create_task(self._stats_loop(), name="stats"),
+            asyncio.create_task(self._aave_oracle_price_loop(), name="aave_oracle"),
             # _presigner_loop disabled — CachePrewarmer replaces it with HF<1.15 coverage
             # asyncio.create_task(self._presigner_loop(), name="presigner"),
             asyncio.create_task(self._shutdown_waiter(), name="shutdown"),
@@ -621,6 +654,42 @@ class LiquidationPipelineV3:
                 best_asset = reserve.asset
 
         return best_asset
+
+    async def _aave_oracle_price_loop(self) -> None:
+        """
+        Polls Aave V3 oracle every 60s for assets not covered by our Chainlink feeds
+        (weETH, rsETH, ezETH, rETH, native USDC, GHO, etc.) and injects them into
+        the PriceRegistry so CollateralSelector can price these collateral types.
+        Uses rpc_light (PublicNode) — single eth_call per asset, low frequency.
+        """
+        from eth_abi import decode as abi_decode
+        oracle = Web3.to_checksum_address(AAVE_ORACLE_ADDR)
+
+        while True:
+            try:
+                updated = 0
+                for asset_addr in AAVE_ORACLE_ASSETS:
+                    try:
+                        calldata = AAVE_ORACLE_GET_PRICE_SEL + self.rpc_light.w3.codec.encode(
+                            ["address"], [asset_addr]
+                        )
+                        result = await self.rpc_light.w3.eth.call(
+                            {"to": oracle, "data": calldata}
+                        )
+                        price = abi_decode(["uint256"], result)[0]
+                        if price > 0:
+                            self.prices.update_price(asset_addr, price)
+                            updated += 1
+                        await asyncio.sleep(0.2)   # gentle pacing
+                    except Exception:
+                        pass
+                if updated:
+                    logger.debug(f"[AaveOracle] Updated {updated} supplemental prices")
+            except asyncio.CancelledError:
+                return
+            except Exception as e:
+                logger.debug(f"[AaveOracle] price loop error: {e}")
+            await asyncio.sleep(60)
 
     async def shutdown(self):
         logger.info("Shutting down subsystems...")
