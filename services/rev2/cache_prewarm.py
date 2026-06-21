@@ -114,7 +114,7 @@ class CachePrewarmer:
         top_n: int = 20,
         refresh_interval: float = 25.0,   # seconds between full refresh cycles
         hf_ceiling: float = 1.15,         # only pre-warm positions below this HF
-        max_build_time_ms: float = 350.0, # skip build if it takes too long
+        max_build_time_ms: float = 1500.0, # was 350 — Aave V3 flash loan quotes routinely >350ms
         max_cache_size: int = 40,         # hard ceiling — evict only above this
     ):
         self._loader        = loader
@@ -129,6 +129,17 @@ class CachePrewarmer:
         self._cache: dict[str, CacheEntry] = {}
         self._running = False
         self._task: Optional[asyncio.Task] = None
+
+        # Dust cache: skip rebuild for positions that failed or produced
+        # sub-threshold profit recently — the top-N is dominated by dead
+        # borrowers whose positions were closed but HF engine hasn't pruned yet.
+        self._dust_cache: dict[str, tuple[float, float]] = {}
+        #                                   (hf_when_checked, timestamp)
+
+        # Profit cache: skip rebuild when last build produced <$0.01 profit
+        # and HF hasn't moved — catches ghost positions that "build" but at $0.
+        self._profit_cache: dict[str, tuple[float, float]] = {}
+        #                                    (profit, timestamp)
 
         # Stats
         self._builds_total    = 0
@@ -231,6 +242,7 @@ class CachePrewarmer:
 
         builds_this_cycle = 0
         skips_this_cycle  = 0
+        dust_skips = 0
 
         for addr, hf in targets:
             addr_lower = addr.lower()
@@ -241,12 +253,30 @@ class CachePrewarmer:
                 skips_this_cycle += 1
                 continue
 
+            # Skip if in dust cache — position was dead/dust <5 min ago
+            if addr_lower in self._dust_cache:
+                cached_hf, cached_ts = self._dust_cache[addr_lower]
+                hf_unchanged = abs(hf - cached_hf) < 0.001
+                if hf_unchanged and (time.time() - cached_ts) < 300:
+                    dust_skips += 1
+                    continue  # still dust, skip rebuild
+
+            # Skip if in profit cache — last build was $0 profit, HF unchanged
+            if addr_lower in self._profit_cache:
+                cached_profit, cached_ts = self._profit_cache[addr_lower]
+                if cached_profit < 0.01 and (time.time() - cached_ts) < 300:
+                    dust_skips += 1
+                    continue  # sub-cent profit, skip rebuild
+
             # Build presigned tx
-            build_ok = await self._build_one(addr, hf, base_fee)
+            build_ok, profit = await self._build_one(addr, hf, base_fee)
             if build_ok:
                 builds_this_cycle += 1
+                self._dust_cache.pop(addr_lower, None)  # clear dust flag
+                self._profit_cache[addr_lower] = (profit, time.time())
             else:
                 self._builds_failed += 1
+                self._dust_cache[addr_lower] = (hf, time.time())  # mark as dust
 
             # Yield between builds — don't starve oracle processing
             await asyncio.sleep(0)
@@ -302,12 +332,13 @@ class CachePrewarmer:
         self._cycles         += 1
         self._last_cycle_ms   = (time.perf_counter() - t0) * 1000
 
-        if builds_this_cycle > 0 or evicted > 0:
+        if builds_this_cycle > 0 or evicted > 0 or dust_skips > 0:
             logger.info(
                 f"[CachePrewarm] Cycle {self._cycles} — "
                 f"targets={len(targets)} "
                 f"built={builds_this_cycle} "
                 f"skipped={skips_this_cycle} "
+                f"dust={dust_skips} "
                 f"evicted={evicted} "
                 f"warm={self.warm_count}/{len(targets)} "
                 f"cycle_time={self._last_cycle_ms:.0f}ms"
@@ -319,18 +350,25 @@ class CachePrewarmer:
                 f"({self._last_cycle_ms:.0f}ms)"
             )
 
-    async def _build_one(self, addr: str, hf: float, base_fee: int) -> bool:
+    async def _build_one(self, addr: str, hf: float, base_fee: int) -> tuple[bool, float]:
         """
         Build and cache a presigned tx for one borrower.
-        Returns True on success, False on failure/timeout.
+        Returns (success, estimated_profit_usd). Profit is 0.0 on failure.
         """
         t0 = time.perf_counter()
         try:
-            success = await asyncio.wait_for(
+            result = await asyncio.wait_for(
                 self._build_fn(addr),
                 timeout=self._max_build_ms / 1000,
             )
             ms = (time.perf_counter() - t0) * 1000
+
+            # Unpack (success, profit) tuple
+            if isinstance(result, tuple):
+                success, profit = result
+            else:
+                # Backward compat: old bool-only return
+                success, profit = result, 0.0
 
             if success:
                 self._cache[addr.lower()] = CacheEntry(
@@ -342,12 +380,12 @@ class CachePrewarmer:
                 self._builds_total += 1
                 logger.debug(
                     f"[CachePrewarm] Built tx for {addr[:10]}… "
-                    f"HF={hf:.4f} in {ms:.0f}ms"
+                    f"HF={hf:.4f} profit=\${profit:.2f} in {ms:.0f}ms"
                 )
-                return True
+                return (True, profit)
             else:
                 logger.debug(f"[CachePrewarm] build_fn returned False for {addr[:10]}…")
-                return False
+                return (False, 0.0)
 
         except asyncio.TimeoutError:
             ms = (time.perf_counter() - t0) * 1000
@@ -356,11 +394,11 @@ class CachePrewarmer:
                 f"after {ms:.0f}ms — skipping"
             )
             self._builds_skipped += 1
-            return False
+            return (False, 0.0)
 
         except Exception as e:
             logger.warning(f"[CachePrewarm] Build error for {addr[:10]}…: {e}")
-            return False
+            return (False, 0.0)
 
     async def _loop(self) -> None:
         """Background refresh loop."""

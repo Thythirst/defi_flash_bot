@@ -5,7 +5,7 @@ from datetime import datetime
 from web3 import AsyncWeb3
 from web3.providers import AsyncHTTPProvider
 
-DB = "/root/defi_flash_bot/prod/backtest_full2.db"
+DB = "/home/ubuntu/defi_flash_bot/backtest_full2.db"
 RPC = "https://arb1.arbitrum.io/rpc"
 CONCURRENCY = 15
 LEGACY_GAS_MULT = 1.5

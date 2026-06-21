@@ -5,7 +5,7 @@ from dotenv import load_dotenv
 from web3 import Web3
 from web3.providers.rpc import HTTPProvider
 
-project_root = Path("/root/defi_flash_bot/prod")
+project_root = Path("/home/ubuntu/defi_flash_bot")
 load_dotenv(dotenv_path=project_root / ".env")
 
 rpc = os.getenv("ALCHEMY_HTTP_URL")

@@ -5,12 +5,12 @@ Reads liquidations.db and Redis comp:stats to profile who's winning
 races, at what gas price, and which positions they target.
 
 Cron entry (Monday 10:00 UTC):
-    0 10 * * 1 /root/defi_flash_bot/prod/venv/bin/python3 \
-        /root/defi_flash_bot/prod/scripts/competitor_summary.py \
-        >> /root/defi_flash_bot/prod/logs/competitor_summary.log 2>&1
+    0 10 * * 1 /home/ubuntu/defi_flash_bot/venv/bin/python3 \
+        /home/ubuntu/defi_flash_bot/scripts/competitor_summary.py \
+        >> /home/ubuntu/defi_flash_bot/logs/competitor_summary.log 2>&1
 
 Requires: liquidations.db with at least some lost_race/lost_race_observed rows.
-Output:   logs + /root/defi_flash_bot/prod/logs/competitor_weekly.json
+Output:   logs + /home/ubuntu/defi_flash_bot/logs/competitor_weekly.json
 """
 
 import json
@@ -30,7 +30,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-PROD_DIR    = Path("/root/defi_flash_bot/prod")
+PROD_DIR    = Path("/home/ubuntu/defi_flash_bot")
 OUTCOMES_DB = PROD_DIR / "liquidations.db"
 REPORT_FILE = PROD_DIR / "logs" / "competitor_weekly.json"
 REDIS_URL   = os.getenv("REDIS_URL", "redis://localhost:6379")

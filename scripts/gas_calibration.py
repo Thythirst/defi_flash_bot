@@ -5,9 +5,9 @@ Reads backtest_full2.db, computes optimal surge_buffer and percentile,
 writes updated config for pipeline to pick up on next restart.
 
 Cron entry (Sunday 11:00 UTC):
-    0 11 * * 0 /root/defi_flash_bot/prod/venv/bin/python3 \\
-        /root/defi_flash_bot/prod/scripts/gas_calibration.py \\
-        >> /root/defi_flash_bot/prod/logs/gas_calibration.log 2>&1
+    0 11 * * 0 /home/ubuntu/defi_flash_bot/venv/bin/python3 \\
+        /home/ubuntu/defi_flash_bot/scripts/gas_calibration.py \\
+        >> /home/ubuntu/defi_flash_bot/logs/gas_calibration.log 2>&1
 """
 
 import json, logging, os, sqlite3
@@ -16,7 +16,7 @@ from pathlib import Path
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s")
 logger = logging.getLogger(__name__)
 
-PROD_DIR    = Path("/root/defi_flash_bot/prod")
+PROD_DIR    = Path("/home/ubuntu/defi_flash_bot")
 BACKTEST_DB = PROD_DIR / "backtest_full2.db"
 GAS_CONFIG  = PROD_DIR / "config" / "gas_oracle.json"
 

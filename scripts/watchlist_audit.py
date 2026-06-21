@@ -4,9 +4,9 @@ watchlist_audit.py — Every 6 hours: verify watchlist health
 Spot-checks random addresses for active debt, reports ghost ratio.
 
 Cron entry:
-    0 */6 * * * /root/defi_flash_bot/prod/venv/bin/python3 \\
-        /root/defi_flash_bot/prod/scripts/watchlist_audit.py \\
-        >> /root/defi_flash_bot/prod/logs/watchlist_audit.log 2>&1
+    0 */6 * * * /home/ubuntu/defi_flash_bot/venv/bin/python3 \\
+        /home/ubuntu/defi_flash_bot/scripts/watchlist_audit.py \\
+        >> /home/ubuntu/defi_flash_bot/logs/watchlist_audit.log 2>&1
 """
 
 import asyncio, json, logging, os, random, time
@@ -17,7 +17,7 @@ from web3.providers import AsyncHTTPProvider
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s")
 logger = logging.getLogger(__name__)
 
-PROD_DIR   = Path("/root/defi_flash_bot/prod")
+PROD_DIR   = Path("/home/ubuntu/defi_flash_bot")
 STATE_FILE = PROD_DIR / "logs" / "watchlist_audit_state.json"
 AAVE_POOL  = "0x794a61358D6845594F94dc1DB02A252b5b4814aD"
 MC3        = "0xcA11bde05977b3631167028862bE2a173976CA11"

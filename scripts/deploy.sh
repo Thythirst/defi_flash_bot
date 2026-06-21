@@ -5,7 +5,7 @@ set -euo pipefail
 
 SERVICES="${1:-all}"
 DRY_RUN="${2:-false}"
-PROD_DIR="/root/defi_flash_bot/prod"
+PROD_DIR="/home/ubuntu/defi_flash_bot"
 VENV_PYTHON="$PROD_DIR/venv/bin/python"
 LOG_DIR="$PROD_DIR/logs"
 HEALTH_URL="http://localhost:8080/health"

@@ -4,7 +4,7 @@
 Tracks PRE-LIQ reduction, dedup impact, RPC metrics, and crucially:
 whether any dedup-suppressed borrower later became liquidatable on-chain.
 
-Run: python3 /root/defi_flash_bot/prod/scripts/validation_monitor.py
+Run: python3 /home/ubuntu/defi_flash_bot/scripts/validation_monitor.py
 Stops after 6 hours, writes final report to /tmp/validation_report.txt
 """
 
@@ -19,7 +19,7 @@ from collections import defaultdict
 from datetime import datetime, timedelta
 from pathlib import Path
 
-sys.path.insert(0, "/root/defi_flash_bot/prod")
+sys.path.insert(0, "/home/ubuntu/defi_flash_bot")
 from dotenv import load_dotenv
 load_dotenv()
 
@@ -30,9 +30,9 @@ from web3 import Web3
 # ── Config ─────────────────────────────────────────────────
 DURATION_HOURS = 6
 CHECK_INTERVAL = 300  # every 5 minutes
-PRELIQ_LOG = "/root/defi_flash_bot/prod/preliq.log"
-CHAINLINK_LOG = "/root/defi_flash_bot/prod/logs/chainlink_sim_service_error.log"
-DRYRUN_LOG = "/root/defi_flash_bot/prod/dryrun.log"
+PRELIQ_LOG = "/home/ubuntu/defi_flash_bot/preliq.log"
+CHAINLINK_LOG = "/home/ubuntu/defi_flash_bot/logs/chainlink_sim_service_error.log"
+DRYRUN_LOG = "/home/ubuntu/defi_flash_bot/dryrun.log"
 AAVE_POOL = "0x794a61358D6845594F94dc1DB02A252b5b4814aD"
 RPC_URL = os.getenv("QUICKNODE_HTTP_URL", os.getenv("ARBITRUM_HTTP_URL", "https://arb1.arbitrum.io/rpc"))
 REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379")

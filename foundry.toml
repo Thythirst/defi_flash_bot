@@ -3,6 +3,10 @@ src = "contracts"
 out = "out"
 test = "tests"
 libs = ["lib"]
+remappings = [
+    "@openzeppelin/contracts/=lib/openzeppelin-contracts/contracts/",
+    "forge-std/=lib/forge-std/src/",
+]
 via_ir = true
 optimizer = true
 optimizer_runs = 200

@@ -35,7 +35,7 @@ logger = logging.getLogger(__name__)
 # ── Contract addresses (Arbitrum One) ────────────────────────────────────
 
 AAVE_V3_POOL = "0x794a61358D6845594F94dc1Db02A252b5b4814ad"
-FLASH_EXECUTOR_V3 = "0x4CdADEd4749FcB498e7E371EBF00C319674D3F8D"
+FLASH_EXECUTOR_V3 = "0x83d60B7DE4334Fd34492E18cA95B2b9e47F00D80"
 BALANCER_VAULT = "0xBA12222222228d8Ba445958a75a0704d566BF2C8"
 
 # Aave V3 Pool ABI (minimal, for ABI encoding)

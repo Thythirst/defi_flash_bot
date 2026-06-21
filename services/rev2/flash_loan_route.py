@@ -68,7 +68,7 @@ logger = logging.getLogger(__name__)
 BALANCER_VAULT    = "0xBA12222222228d8Ba445958a75a0704d566BF2C8"
 UNI_V3_ROUTER     = "0xE592427A0AEce92De3Edee1F18E0157C05861564"  # SwapRouter01
 UNI_V3_ROUTER02   = "0x68b3465833fb72A70ecDF485E0e4C7bD8665Fc45"  # SwapRouter02
-EXECUTOR_ADDR     = "0x4CdADEd4749FcB498e7E371EBF00C319674D3F8D"
+EXECUTOR_ADDR     = "0x83d60B7DE4334Fd34492E18cA95B2b9e47F00D80"
 
 # Common Arbitrum token addresses — for WETH wrapping on swap path
 WETH_ARBITRUM     = "0x82aF49447D8a07e3bd95BD0d56f35241523fBab1"
@@ -94,6 +94,21 @@ EXECUTOR_ABI = [
             {"internalType": "bytes",   "name": "swapCalldata",    "type": "bytes"},
         ],
         "name": "executeLiquidation",
+        "outputs": [],
+        "stateMutability": "nonpayable",
+        "type": "function",
+    },
+    {
+        "inputs": [
+            {"internalType": "address", "name": "collateralAsset", "type": "address"},
+            {"internalType": "address", "name": "debtAsset",       "type": "address"},
+            {"internalType": "address", "name": "borrower",        "type": "address"},
+            {"internalType": "uint256", "name": "debtToCover",     "type": "uint256"},
+            {"internalType": "bool",    "name": "receiveAToken",   "type": "bool"},
+            {"internalType": "address", "name": "swapRouter",      "type": "address"},
+            {"internalType": "bytes",   "name": "swapCalldata",    "type": "bytes"},
+        ],
+        "name": "executeLiquidationViaAave",
         "outputs": [],
         "stateMutability": "nonpayable",
         "type": "function",
@@ -193,6 +208,7 @@ class FlashLoanTxData:
     gas_price:       int
     nonce:           int
     estimated_profit_usd: float
+    flash_source:    str = 'balancer'  # 'balancer' or 'aave'
 
 
 # ---------------------------------------------------------------------------
@@ -633,6 +649,34 @@ class FlashLoanTxBuilder:
         # Sync Web3 for signing only (local operation, no RPC)
         self._sync_w3 = Web3()
 
+    async def _erc20_balance(self, token: str, holder: str) -> int:
+        """Read ERC-20 balanceOf via async eth_call."""
+        token  = AsyncWeb3.to_checksum_address(token)
+        holder = AsyncWeb3.to_checksum_address(holder)
+        addr_padded = holder[2:].lower().rjust(64, '0')
+        data = '0x70a08231' + addr_padded
+        try:
+            result = await self._rpc.w3.eth.call({'to': token, 'data': data})
+            return int(result.hex(), 16) if result and result != b'' else 0
+        except Exception:
+            return 0
+
+    async def choose_flash_source(self, flash_token: str, amount: int) -> str:
+        """
+        Decide which flash loan source to use based on available liquidity.
+        Returns 'balancer' (0% fee, preferred) or 'aave' (0.09% fee, deep liquidity).
+        """
+        balancer_balance = await self._erc20_balance(flash_token, BALANCER_VAULT)
+
+        if balancer_balance >= amount:
+            return 'balancer'   # 0% fee — preferred when liquidity exists
+
+        logger.info(
+            f"[FlashSource] Balancer short for {flash_token[:10]}…: "
+            f"has {balancer_balance}, need {amount} → routing to Aave"
+        )
+        return 'aave'            # 0.09% fee (9 bps) — deep liquidity for pool reserves
+
     async def build(
         self,
         collateral_asset: str,
@@ -700,9 +744,38 @@ class FlashLoanTxBuilder:
                 )
                 return None
 
-        # Amount to swap: collateral received ≈ debt_to_cover × (1 + liq_bonus)
-        # Use collateral_amount if provided, else estimate from debt_to_cover
-        # with a 5% bonus assumption as conservative floor
+        # ── Recompute slippage in oracle-price terms before validation ──────────
+        # SwapCalldataBuilder computes slippage as (amount_in - amount_out)/amount_in
+        # in raw token units, which is meaningless cross-asset (e.g. WETH→USDC always
+        # reads ~100% because 1e18 >> 3000e6). Override here using oracle prices so
+        # RouteValidator's 2% gate sees actual DEX market-impact slippage.
+        if (
+            swap_route is not None
+            and swap_route.router != "0x0000000000000000000000000000000000000000"
+            and asset_prices_usd
+            and asset_decimals
+            and swap_route.amount_in > 0
+        ):
+            col_key   = collateral_asset.lower()
+            debt_key  = debt_asset.lower()
+            col_price = next((p for k, p in asset_prices_usd.items() if k.lower() == col_key), 0)
+            dbt_price = next((p for k, p in asset_prices_usd.items() if k.lower() == debt_key), 0)
+            col_dec   = asset_decimals.get(collateral_asset, asset_decimals.get(col_key, 18))
+            dbt_dec   = asset_decimals.get(debt_asset,       asset_decimals.get(debt_key, 18))
+            if col_price > 0 and dbt_price > 0:
+                oracle_out = swap_route.amount_in * col_price * (10 ** dbt_dec) // (dbt_price * (10 ** col_dec))
+                if oracle_out > 0:
+                    swap_route.slippage_pct = max(0.0, (oracle_out - swap_route.amount_out) / oracle_out)
+                    logger.debug(
+                        f"[FlashLoanBuilder] Oracle-normalised slippage for "
+                        f"{collateral_asset[:10]}→{debt_asset[:10]}: "
+                        f"{swap_route.slippage_pct:.3%} "
+                        f"(oracle_out={oracle_out} actual={swap_route.amount_out})"
+                    )
+
+        # ── Flash loan liquidity check (ALL paths — Balancer vault must hold enough) ──
+        flash_source = await self.choose_flash_source(debt_asset, debt_to_cover)
+        self._flash_source = flash_source  # used in _estimate_profit for fee adjustment
 
         # Validate before building (skip for same-asset — no router needed)
         if swap_route.router != "0x0000000000000000000000000000000000000000":
@@ -726,9 +799,15 @@ class FlashLoanTxBuilder:
             max_fee      = int(base_fee * self.GAS_PREMIUM * 2)
             priority_fee = max(int(base_fee * 0.5), 1_000_000)  # min 0.001 gwei tip
 
-        # Build transaction
+        # Build transaction — select contract function based on flash source
         try:
-            tx_dict = await self._executor.functions.executeLiquidation(
+            if flash_source == 'aave':
+                contract_fn = self._executor.functions.executeLiquidationViaAave
+                logger.debug(f"[FlashLoanBuilder] Using Aave flash loan for {debt_asset[:10]}…")
+            else:
+                contract_fn = self._executor.functions.executeLiquidation
+
+            tx_dict = await contract_fn(
                 collateral_asset,
                 debt_asset,
                 borrower,
@@ -753,10 +832,23 @@ class FlashLoanTxBuilder:
             logger.error(f"[FlashLoanBuilder] TX build failed: {e}")
             return None
 
-        # Estimate profit for telemetry
+        # Estimate profit for telemetry — subtract Aave fee if applicable
         estimated_profit_usd = self._estimate_profit(
             swap_route, debt_asset, debt_to_cover, max_fee, asset_prices_usd, asset_decimals
         )
+        if flash_source == 'aave':
+            # Aave V3 flashLoanSimple fee: 0.09% (9 bps) — deducted from profit estimate
+            dec = asset_decimals.get(debt_asset, 18) if asset_decimals else 18
+            debt_amount = debt_to_cover / (10 ** dec)
+            debt_price_usd = 1.0  # default: stablecoin
+            if asset_prices_usd:
+                debt_key = debt_asset.lower()
+                debt_price_usd = next(
+                    (p / 1e8 for k, p in asset_prices_usd.items() if k.lower() == debt_key),
+                    1.0,
+                )
+            aave_fee_usd = debt_amount * debt_price_usd * 0.0009
+            estimated_profit_usd = max(0, estimated_profit_usd - aave_fee_usd)
 
         logger.info(
             f"[FlashLoanBuilder] Built flash loan tx — "
@@ -766,6 +858,7 @@ class FlashLoanTxBuilder:
             f"debtToCover={debt_to_cover} "
             f"fee_tier={swap_route.fee_tier} "
             f"slippage={swap_route.slippage_pct:.2%} "
+            f"source={flash_source} "
             f"est_profit=${estimated_profit_usd:.2f}"
         )
 
@@ -780,6 +873,7 @@ class FlashLoanTxBuilder:
             gas_price        = max_fee,
             nonce            = nonce,
             estimated_profit_usd = estimated_profit_usd,
+            flash_source     = flash_source,
         )
 
     def _estimate_profit(
@@ -863,7 +957,13 @@ class FlashLoanTxBuilder:
                 priority_fee = max(int(base_fee * 0.5), 1_000_000)
 
             # Rebuild tx dict — reuse ALL cached params, only nonce changes
-            tx_dict = await self._executor.functions.executeLiquidation(
+            # Respect cached flash source (balancer vs aave)
+            if cached.flash_source == 'aave':
+                contract_fn = self._executor.functions.executeLiquidationViaAave
+            else:
+                contract_fn = self._executor.functions.executeLiquidation
+
+            tx_dict = await contract_fn(
                 cached.collateral_asset,
                 cached.debt_asset,
                 cached.borrower,

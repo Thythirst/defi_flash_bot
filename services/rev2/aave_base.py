@@ -664,14 +664,42 @@ class BaseFlashLoanTxBuilder:
 # BaseWatchlistBuilder — Borrow event scraper for Base chain
 # ---------------------------------------------------------------------------
 
+# getUserAccountData ABI — used for debt validation via Multicall3
+POOL_ACCOUNT_DATA_ABI = [
+    {
+        "inputs": [{"internalType": "address", "name": "user", "type": "address"}],
+        "name": "getUserAccountData",
+        "outputs": [
+            {"internalType": "uint256", "name": "totalCollateralBase",          "type": "uint256"},
+            {"internalType": "uint256", "name": "totalDebtBase",                "type": "uint256"},
+            {"internalType": "uint256", "name": "availableBorrowsBase",         "type": "uint256"},
+            {"internalType": "uint256", "name": "currentLiquidationThreshold", "type": "uint256"},
+            {"internalType": "uint256", "name": "ltv",                          "type": "uint256"},
+            {"internalType": "uint256", "name": "healthFactor",                 "type": "uint256"},
+        ],
+        "stateMutability": "view",
+        "type": "function",
+    }
+]
+
+WAD = 10 ** 18
+
+
 class BaseWatchlistBuilder:
     """
     Scrapes Aave V3 Base Borrow events to build borrower watchlist.
-    Identical to Arbitrum's historical backfill, different pool address
-    and deploy block.
+    Validates on-chain debt via Multicall3 BEFORE writing to Redis —
+    prevents phantom positions (closed/zero-debt borrowers) from
+    polluting the watchlist.
+
+    Flow:
+        1. Scan Borrow events → collect all addresses
+        2. Batch-verify via Multicall3 → filter totalDebtBase > 0
+        3. Write only verified-active addresses to Redis with real HF
     """
 
     BORROW_TOPIC = "0xb3d084820fb1a9decffb176436bd02558d15fac9b0ddfed8c465bc7359d7dce0"
+    VERIFY_BATCH_SIZE = 200   # matches PositionLoader.BATCH_SIZE
 
     def __init__(
         self,
@@ -686,12 +714,87 @@ class BaseWatchlistBuilder:
         self._chunk   = blocks_per_chunk
         self._ckpt    = f"{redis_key}:backfill_checkpoint"
 
+        # Multicall3 contract — same address on all EVM chains
+        self._mc = w3.eth.contract(
+            address=AsyncWeb3.to_checksum_address(BaseChainConfig.MULTICALL3),
+            abi=MULTICALL3_ABI,
+        )
+        # Pool contract (for calldata encoding)
+        self._pool = w3.eth.contract(
+            address=AsyncWeb3.to_checksum_address(BaseChainConfig.AAVE_POOL),
+            abi=POOL_ACCOUNT_DATA_ABI,
+        )
+
+    async def _verify_active_debt(self, addresses: set[str]) -> dict[str, float]:
+        """
+        Batch-verify on-chain debt via Multicall3 aggregate3.
+        Returns {address: health_factor} ONLY for addresses with totalDebtBase > 0.
+        Ghosts (zero debt) are silently dropped.
+        """
+        active: dict[str, float] = {}
+        addr_list = list(addresses)
+        chunks = [
+            addr_list[i:i + self.VERIFY_BATCH_SIZE]
+            for i in range(0, len(addr_list), self.VERIFY_BATCH_SIZE)
+        ]
+
+        for chunk in chunks:
+            calls = []
+            valid_addrs = []
+            for addr in chunk:
+                try:
+                    ca = AsyncWeb3.to_checksum_address(addr)
+                    call_data = self._pool.functions.getUserAccountData(ca)._encode_transaction_data()
+                    calls.append({
+                        "target":       AsyncWeb3.to_checksum_address(BaseChainConfig.AAVE_POOL),
+                        "allowFailure": True,
+                        "callData":     call_data,
+                    })
+                    valid_addrs.append(addr.lower())
+                except Exception:
+                    continue
+
+            if not calls:
+                continue
+
+            try:
+                results = await asyncio.wait_for(
+                    self._mc.functions.aggregate3(calls).call(),
+                    timeout=30.0,
+                )
+            except asyncio.TimeoutError:
+                logger.warning("[BaseWatchlist] Multicall3 timed out during debt verify")
+                await asyncio.sleep(2)
+                continue
+            except Exception as e:
+                logger.warning(f"[BaseWatchlist] Multicall3 failed: {e}")
+                await asyncio.sleep(2)
+                continue
+
+            for addr, (success, raw) in zip(valid_addrs, results):
+                if not success or len(raw) < 192:
+                    continue
+                try:
+                    h          = raw.hex()
+                    total_debt = int(h[64:128], 16)   # slot 1: totalDebtBase
+                    hf_raw     = int(h[320:384], 16)  # slot 5: healthFactor
+                    if total_debt == 0:
+                        continue
+                    hf = min(hf_raw / WAD, 10.0)
+                    active[addr] = hf
+                except Exception:
+                    continue
+
+            await asyncio.sleep(0)
+
+        return active
+
     async def backfill(
         self,
         start_block: Optional[int] = None,
         end_block:   Optional[int] = None,
     ) -> int:
-        """Scrape Borrow events and populate Redis ZSET."""
+        """Scrape Borrow events, verify debt, and populate Redis ZSET."""
         if end_block is None:
             end_block = await self._w3.eth.block_number
         if start_block is None:
@@ -717,8 +820,6 @@ class BaseWatchlistBuilder:
                 })
                 for log in logs:
                     topics = log.get("topics", [])
-                    # topic[2] is user (Borrow(address,address,address,uint256,uint8,uint256,uint16))
-                    # topic[3] is referralCode — uint16, not an address
                     if len(topics) >= 3:
                         t2   = topics[2] if isinstance(topics[2], str) else topics[2].hex()
                         addr = "0x" + t2[-40:]
@@ -746,16 +847,45 @@ class BaseWatchlistBuilder:
                     self._chunk = max(500, self._chunk // 2)
                 continue
 
-        logger.info(f"[BaseWatchlist] Scan done — {len(addresses):,} addresses found")
+        n_raw = len(addresses)
+        logger.info(f"[BaseWatchlist] Scan done — {n_raw:,} addresses found")
 
+        # ─── VERIFY: only keep addresses with active on-chain debt ───
+        logger.info(f"[BaseWatchlist] Verifying on-chain debt for {n_raw:,} addresses...")
+        active = await self._verify_active_debt(addresses)
+        n_active = len(active)
+        n_ghosts = n_raw - n_active
+        ghost_pct = n_ghosts / n_raw * 100 if n_raw > 0 else 0
+
+        logger.info(
+            f"[BaseWatchlist] Debt verification complete — "
+            f"active={n_active:,} ghosts={n_ghosts:,} ({ghost_pct:.1f}% phantom)"
+        )
+
+        # ─── WRITE: only active addresses with real HF, minus excluded ───
+        excluded = await self._redis.smembers(f"{self._key}:excluded")
+        excluded_set = {
+            (e.decode() if isinstance(e, bytes) else e).lower()
+            for e in excluded
+        }
+        n_excluded = 0
         pipe = self._redis.pipeline()
-        for addr in addresses:
-            pipe.zadd(self._key, {addr: 2.0})
+        for addr, hf in active.items():
+            if addr.lower() in excluded_set:
+                n_excluded += 1
+                continue
+            pipe.zadd(self._key, {addr: hf})
         await pipe.execute()
         await self._redis.delete(self._ckpt)
 
-        logger.info(f"[BaseWatchlist] {len(addresses):,} borrowers written to {self._key}")
-        return len(addresses)
+        written = n_active - n_excluded
+        if n_excluded:
+            logger.info(
+                f"[BaseWatchlist] {n_excluded} excluded addresses skipped "
+                f"(watchlist:base:aave:excluded)"
+            )
+        logger.info(f"[BaseWatchlist] {written:,} verified-active borrowers written to {self._key}")
+        return written
 
 
 # ---------------------------------------------------------------------------
@@ -842,13 +972,29 @@ class AaveBaseModule:
             pool_address = BaseChainConfig.AAVE_POOL,
         )
 
-        # Load watchlist
+        # Load watchlist — filter out known-excluded addresses
+        #   watchlist:base:excluded — addresses we've confirmed are
+        #   unliquidatable (e.g. weETH collateral with no DEX liquidity)
         members = await self._redis.zrange("watchlist:base:aave", 0, -1)
+        excluded = await self._redis.smembers("watchlist:base:excluded")
+        excluded_set = {
+            (e.decode() if isinstance(e, bytes) else e).lower()
+            for e in excluded
+        }
         if members:
-            watchlist = [
-                m.decode() if isinstance(m, bytes) else m
-                for m in members
-            ]
+            watchlist = []
+            skipped = 0
+            for m in members:
+                addr = m.decode() if isinstance(m, bytes) else m
+                if addr.lower() in excluded_set:
+                    skipped += 1
+                    continue
+                watchlist.append(addr)
+            if skipped:
+                logger.info(
+                    f"[AaveBase] Skipped {skipped} excluded addresses "
+                    f"(watchlist:base:excluded)"
+                )
             loaded = await self._loader.bootstrap(watchlist)
             logger.info(f"[AaveBase] {loaded} positions loaded from watchlist")
         else:

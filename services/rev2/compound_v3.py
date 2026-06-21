@@ -33,6 +33,7 @@ Usage:
 
 import asyncio
 import logging
+import os
 import time
 from dataclasses import dataclass, field
 from typing import Optional
@@ -51,18 +52,21 @@ COMPOUND_MARKETS = {
         "base_token": "0xaf88d065e77c8cC2239327C5EDb3A432268e5831",  # native USDC
         "base_decimals": 6,
         "redis_key":  "watchlist:compound:usdc",
+        "executor":   os.getenv("COMPOUND_EXECUTOR_ADDR", ""),
     },
     "USDT": {
         "comet":      "0xd98Be00b5D27fc98112BdE293e487f8D4cA57d07",
         "base_token": "0xFd086bC7CD5C481DCC9C85ebE478A1C0b69FCbb9",  # USDT
         "base_decimals": 6,
         "redis_key":  "watchlist:compound:usdt",
+        "executor":   os.getenv("COMPOUND_USDT_EXECUTOR_ADDR", ""),
     },
     "ETH": {
         "comet":      "0x6f7D514bbD4aFf3BcD1140B7344b32f063dEe486",
         "base_token": "0x82aF49447D8a07e3bd95BD0d56f35241523fBab1",  # WETH
         "base_decimals": 18,
         "redis_key":  "watchlist:compound:eth",
+        "executor":   "",   # not deployed — $1K TVL, skip
     },
 }
 
@@ -679,7 +683,7 @@ class CompoundV3Module:
         self._nonce        = nonce_mgr
         self._skip         = skip_tel
         self._quoter       = quoter
-        self._executor_addr= AsyncWeb3.to_checksum_address(executor_addr)
+        self._executor_addr= AsyncWeb3.to_checksum_address(executor_addr) if executor_addr else executor_addr
         self._pk           = private_key
         self._wallet       = AsyncWeb3.to_checksum_address(wallet)
         self._markets_cfg  = markets or COMPOUND_MARKETS
@@ -706,8 +710,24 @@ class CompoundV3Module:
             loader = CompoundPositionLoader(self._rpc_read.w3, cfg)
             estimator = CompoundEVEstimator(self._rpc_read.w3, cfg, self._quoter)
 
+            # Per-market executor address — config overrides global default.
+            # An explicitly empty string means "intentionally no executor" (e.g. WETH $1K TVL).
+            # Only fall back to the global default if the key is absent entirely.
+            if "executor" in cfg:
+                market_executor = cfg["executor"]
+            else:
+                market_executor = self._executor_addr
+
+            if not market_executor:
+                logger.warning(
+                    f"[CompoundV3] {market_name}: No executor configured — "
+                    f"monitoring only (cannot execute)"
+                )
+                self._executors[market_name] = None
+                continue
+
             executor_contract = self._rpc.w3.eth.contract(
-                address=self._executor_addr,
+                address=AsyncWeb3.to_checksum_address(str(market_executor)),
                 abi=EXECUTOR_ABI,
             )
 
@@ -768,9 +788,16 @@ class CompoundV3Module:
         self._in_flight.add(flight_key)
 
         try:
+            executor = self._executors.get(market_name)
+            if executor is None:
+                logger.debug(
+                    f"[CompoundV3:{market_name}] "
+                    f"No executor — skipping {pos.address[:10]}…"
+                )
+                return
+
             config    = {**self._markets_cfg[market_name], "market": market_name}
             estimator = self._estimators[market_name]
-            executor  = self._executors[market_name]
 
             # Check canBuyCollateral — reverts if reserves >= target
             can_buy = await executor.functions.canBuyCollateral().call()

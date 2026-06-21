@@ -13,12 +13,12 @@ import time
 from collections import defaultdict
 from datetime import datetime, timedelta
 
-sys.path.insert(0, "/root/defi_flash_bot/prod")
+sys.path.insert(0, "/home/ubuntu/defi_flash_bot")
 from dotenv import load_dotenv
 load_dotenv()
 from web3 import Web3
 
-PRELIQ_LOG = "/root/defi_flash_bot/prod/preliq.log"
+PRELIQ_LOG = "/home/ubuntu/defi_flash_bot/preliq.log"
 AAVE_POOL = "0x794a61358D6845594F94dc1DB02A252b5b4814aD"
 RPC_URL = os.getenv("QUICKNODE_HTTP_URL", os.getenv("ARBITRUM_HTTP_URL", "https://arb1.arbitrum.io/rpc"))
 DATA_DIR = "/tmp/validation_data"
@@ -130,7 +130,7 @@ def main():
     snapshot["hf_checks"] = count_between(PRELIQ_LOG, "on-chain HF=", hour_start, hour_end)
     
     # Velocity gates
-    cl_log = "/root/defi_flash_bot/prod/logs/chainlink_sim_service_error.log"
+    cl_log = "/home/ubuntu/defi_flash_bot/logs/chainlink_sim_service_error.log"
     snapshot["velocity_gates"] = count_between(cl_log, "VELOCITY GATE: suppressing", hour_start, hour_end)
     
     # Submitted / confirmed
@@ -179,7 +179,7 @@ def main():
     import subprocess as sp
     rpc_data = {}
     result = sp.run(
-        ["grep", "-a", "RPC METRICS", "/root/defi_flash_bot/prod/dryrun.log"],
+        ["grep", "-a", "RPC METRICS", "/home/ubuntu/defi_flash_bot/dryrun.log"],
         capture_output=True, text=True, timeout=30
     )
     for line in result.stdout.strip().split("\n"):

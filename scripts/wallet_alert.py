@@ -4,9 +4,9 @@ wallet_alert.py — Hourly wallet balance monitor
 Alerts via Telegram + log when ETH balance drops below threshold.
 
 Cron entry (every hour):
-    0 * * * * /root/defi_flash_bot/prod/venv/bin/python3 \
-        /root/defi_flash_bot/prod/scripts/wallet_alert.py \
-        >> /root/defi_flash_bot/prod/logs/wallet_alert.log 2>&1
+    0 * * * * /home/ubuntu/defi_flash_bot/venv/bin/python3 \
+        /home/ubuntu/defi_flash_bot/scripts/wallet_alert.py \
+        >> /home/ubuntu/defi_flash_bot/logs/wallet_alert.log 2>&1
 
 Required env vars:
     BOT_ADDRESS          — wallet to monitor
@@ -44,7 +44,7 @@ logger = logging.getLogger(__name__)
 # Config
 # ---------------------------------------------------------------------------
 
-PROD_DIR     = Path("/root/defi_flash_bot/prod")
+PROD_DIR     = Path(__file__).resolve().parent.parent
 STATE_FILE   = PROD_DIR / "logs" / "wallet_state.json"
 
 WALLET       = os.getenv("BOT_ADDRESS", "")

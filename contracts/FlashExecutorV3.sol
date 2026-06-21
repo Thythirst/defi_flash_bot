@@ -51,6 +51,33 @@ interface IAavePool {
         uint256 debtToCover,
         bool receiveAToken
     ) external;
+
+    /// @notice Aave V3 flash loan — borrows from pool reserves with 0.05% fee
+    /// @param receiverAddress  Contract implementing IFlashLoanSimpleReceiver
+    /// @param asset            Token to borrow (must be a pool reserve)
+    /// @param amount           Amount to borrow
+    /// @param params           Arbitrary data passed to executeOperation()
+    /// @param referralCode     Referral code (0 = none)
+    function flashLoanSimple(
+        address receiverAddress,
+        address asset,
+        uint256 amount,
+        bytes calldata params,
+        uint16 referralCode
+    ) external;
+}
+
+// ─── Aave V3 Flash Loan Receiver ────────────────────────────
+interface IFlashLoanSimpleReceiver {
+    /// @notice Called by Aave Pool after flash-loaning tokens
+    /// @return true if successful, reverts otherwise
+    function executeOperation(
+        address asset,
+        uint256 amount,
+        uint256 premium,
+        address initiator,
+        bytes calldata params
+    ) external returns (bool);
 }
 
 // ─── Structs ────────────────────────────────────────────────
@@ -83,6 +110,7 @@ event Rescue(address indexed token, uint256 amount);
 event EmergencyStop(address indexed triggeredBy);
 event RouterApproved(address indexed router);
 event RouterRevoked(address indexed router);
+event MinProfitThresholdSet(address indexed asset, uint256 threshold);
 
 // ─── Custom Errors ──────────────────────────────────────────
 error UnauthorizedCallback(address caller);
@@ -97,14 +125,19 @@ error TransferETHFailed();
 error FlashLoanInProgress();
 error FlashLoanMismatch(address expectedToken, uint256 expectedAmount);
 
-contract FlashExecutorV3 is Ownable, ReentrancyGuard, Pausable, IFlashLoanRecipient {
+contract FlashExecutorV3 is Ownable, ReentrancyGuard, Pausable, IFlashLoanRecipient, IFlashLoanSimpleReceiver {
     using SafeERC20 for IERC20;
 
     IBalancerVault public immutable BALANCER_VAULT;
     IAavePool public immutable AAVE_POOL;
 
     // Minimum profit threshold (in debt asset wei). Must exceed gas + opportunity cost.
+    // Default for assets without a per-token override.
     uint256 public minProfitThreshold;
+
+    // Per-token overrides — allows different thresholds per debt asset
+    // e.g. WETH at 0.001 WETH, USDC at 2 USDC, etc.
+    mapping(address => uint256) public minProfitThresholds;
 
     // Router whitelist — approved DEX routers for collateral→debt swaps
     mapping(address => bool) public approvedRouters;
@@ -114,6 +147,11 @@ contract FlashExecutorV3 is Ownable, ReentrancyGuard, Pausable, IFlashLoanRecipi
 
     modifier onlyVault() {
         if (msg.sender != address(BALANCER_VAULT)) revert UnauthorizedCallback(msg.sender);
+        _;
+    }
+
+    modifier onlyPool() {
+        if (msg.sender != address(AAVE_POOL)) revert UnauthorizedCallback(msg.sender);
         _;
     }
 
@@ -132,6 +170,22 @@ contract FlashExecutorV3 is Ownable, ReentrancyGuard, Pausable, IFlashLoanRecipi
     // ─── Admin ────────────────────────────────────────────────
     function setMinProfitThreshold(uint256 _minProfitThreshold) external onlyOwner {
         minProfitThreshold = _minProfitThreshold;
+    }
+
+    /// @notice Set a per-token profit threshold override.
+    /// @param asset The debt asset token address
+    /// @param threshold Minimum profit in that asset's native units (e.g. 2 USDC = 2e6)
+    function setMinProfitThreshold(address asset, uint256 threshold) external onlyOwner {
+        if (asset == address(0)) revert InvalidParameters();
+        minProfitThresholds[asset] = threshold;
+        emit MinProfitThresholdSet(asset, threshold);
+    }
+
+    /// @dev Returns the effective threshold for an asset — per-token override if set,
+    ///      otherwise falls back to the global default.
+    function _minProfitForAsset(address asset) internal view returns (uint256) {
+        uint256 override_ = minProfitThresholds[asset];
+        return override_ > 0 ? override_ : minProfitThreshold;
     }
 
     function approveRouter(address router) external onlyOwner {
@@ -202,6 +256,66 @@ contract FlashExecutorV3 is Ownable, ReentrancyGuard, Pausable, IFlashLoanRecipi
 
         try BALANCER_VAULT.flashLoan(address(this), tokens, amounts, abi.encode(route)) {
             // Flash loan completed successfully
+        } catch Error(string memory reason) {
+            _flashLocked = false;
+            emit LiquidationFailed(borrower, reason, block.number);
+            revert FlashLoanFailed();
+        } catch (bytes memory) {
+            _flashLocked = false;
+            emit LiquidationFailed(borrower, "lowLevelRevert", block.number);
+            revert FlashLoanFailed();
+        }
+
+        _flashLocked = false;
+    }
+
+    // ─── Aave V3 Flash Loan Entry ──────────────────────────────
+    /**
+     * @notice Initiate a flash-loan liquidation using Aave V3's native flash loan.
+     *         Borrows from Aave pool reserves (deep liquidity, same token as debt).
+     *         Use this when Balancer vault has insufficient debtAsset liquidity.
+     * @dev  Aave V3 charges 0.05% (5 bps) flash loan fee on most assets.
+     *       Fee is deducted in the executeOperation callback.
+     * @param collateralAsset  Asset used as collateral (what we receive)
+     * @param debtAsset        Asset we repay (flash-loan + liquidate)
+     * @param borrower         User to liquidate (HF < 1.0)
+     * @param debtToCover      Amount of debt to repay (in debt asset wei)
+     * @param receiveAToken    false = receive underlying collateral
+     * @param swapRouter       Router for collateral→debt swap (address(0) if same asset)
+     * @param swapCalldata     Pre-encoded swap calldata (empty if no swap needed)
+     */
+    function executeLiquidationViaAave(
+        address collateralAsset,
+        address debtAsset,
+        address borrower,
+        uint256 debtToCover,
+        bool receiveAToken,
+        address swapRouter,
+        bytes calldata swapCalldata
+    ) external onlyOwner whenNotPaused {
+        if (debtToCover == 0) revert InvalidParameters();
+        if (borrower == address(0)) revert InvalidParameters();
+
+        // Validate swap router if provided
+        if (swapRouter != address(0) && !approvedRouters[swapRouter]) {
+            revert RouterNotApproved(swapRouter);
+        }
+
+        LiquidationRoute memory route = LiquidationRoute({
+            aavePool: address(AAVE_POOL),
+            collateralAsset: collateralAsset,
+            debtAsset: debtAsset,
+            borrower: borrower,
+            debtToCover: debtToCover,
+            receiveAToken: receiveAToken,
+            swapRouter: swapRouter,
+            swapCalldata: swapCalldata
+        });
+
+        _flashLocked = true;
+
+        try AAVE_POOL.flashLoanSimple(address(this), debtAsset, debtToCover, abi.encode(route), 0) {
+            // Flash loan completed successfully — executeOperation() handled everything
         } catch Error(string memory reason) {
             _flashLocked = false;
             emit LiquidationFailed(borrower, reason, block.number);
@@ -303,7 +417,7 @@ contract FlashExecutorV3 is Ownable, ReentrancyGuard, Pausable, IFlashLoanRecipi
         // Net starting position: debtBalanceBefore - debtToCover
         profit = debtBalanceAfter + debtToCover;
         unchecked { profit -= debtBalanceBefore; }
-        if (profit < minProfitThreshold) revert NotProfitable(profit, minProfitThreshold);
+        if (profit < _minProfitForAsset(debtAsset)) revert NotProfitable(profit, _minProfitForAsset(debtAsset));
 
         emit LiquidationExecuted(
             borrower,
@@ -318,10 +432,6 @@ contract FlashExecutorV3 is Ownable, ReentrancyGuard, Pausable, IFlashLoanRecipi
     // ─── Balancer Flash Loan Callback ─────────────────────────
     /**
      * @notice Called by Balancer Vault after transferring flash-loaned tokens.
-     * @param tokens       Flash-loaned token addresses
-     * @param amounts      Flash-loaned amounts
-     * @param feeAmounts   Fees (0 for Balancer on Arbitrum)
-     * @param userData     Encoded LiquidationRoute
      */
     function receiveFlashLoan(
         address[] memory tokens,
@@ -339,28 +449,70 @@ contract FlashExecutorV3 is Ownable, ReentrancyGuard, Pausable, IFlashLoanRecipi
             revert FlashLoanMismatch(route.debtAsset, route.debtToCover);
         }
 
+        _doLiquidation(route, amounts[0], feeAmounts[0], address(BALANCER_VAULT));
+    }
+
+    // ─── Aave V3 Flash Loan Callback ──────────────────────────
+    /**
+     * @notice Called by Aave Pool after flash-loaning tokens.
+     * @dev  Must return true on success (Aave V3 interface requirement).
+     */
+    function executeOperation(
+        address asset,
+        uint256 amount,
+        uint256 premium,
+        address /* initiator */,
+        bytes calldata params
+    ) external onlyPool nonReentrant returns (bool) {
+        LiquidationRoute memory route = abi.decode(params, (LiquidationRoute));
+
+        // Validate flash loan matches what we requested
+        if (asset != route.debtAsset) {
+            revert FlashLoanMismatch(route.debtAsset, route.debtToCover);
+        }
+        if (amount != route.debtToCover) {
+            revert FlashLoanMismatch(route.debtAsset, route.debtToCover);
+        }
+
+        _doLiquidation(route, amount, premium, address(AAVE_POOL));
+        return true;
+    }
+
+    // ─── Shared Liquidation Logic ─────────────────────────────
+    /**
+     * @notice Execute liquidation + optional swap + repay flash loan.
+     * @dev  Called by both Balancer and Aave flash loan callbacks.
+     *       Balancer fee is 0 on Arbitrum; Aave premium is typically 5 bps.
+     * @param route            Liquidation parameters
+     * @param principal        Amount borrowed (debtToCover)
+     * @param fee              Flash loan fee (0 for Balancer, premium for Aave)
+     * @param repaymentTarget  Address to repay (BALANCER_VAULT or AAVE_POOL)
+     */
+    function _doLiquidation(
+        LiquidationRoute memory route,
+        uint256 principal,
+        uint256 fee,
+        address repaymentTarget
+    ) internal {
         // Pre-flight: verify we hold the principal
         uint256 debtAssetBalanceBefore = IERC20(route.debtAsset).balanceOf(address(this));
-        if (debtAssetBalanceBefore < route.debtToCover) revert InsufficientBalance();
+        if (debtAssetBalanceBefore < principal) revert InsufficientBalance();
 
         // ─── Step 1: Aave liquidationCall ─────────────────────
-        // Approve Aave Pool to pull debt asset
-        IERC20(route.debtAsset).forceApprove(route.aavePool, route.debtToCover);
+        IERC20(route.debtAsset).forceApprove(route.aavePool, principal);
 
-        // Execute liquidation
         (bool liqSuccess, bytes memory liqReturnData) = route.aavePool.call(
             abi.encodeWithSelector(
                 IAavePool.liquidationCall.selector,
                 route.collateralAsset,
                 route.debtAsset,
                 route.borrower,
-                route.debtToCover,
+                principal,
                 route.receiveAToken
             )
         );
 
         if (!liqSuccess) {
-            // Bubble up revert reason
             if (liqReturnData.length > 0) {
                 assembly { revert(add(liqReturnData, 32), mload(liqReturnData)) }
             } else {
@@ -368,7 +520,6 @@ contract FlashExecutorV3 is Ownable, ReentrancyGuard, Pausable, IFlashLoanRecipi
             }
         }
 
-        // Revoke approval
         IERC20(route.debtAsset).forceApprove(route.aavePool, 0);
 
         // ─── Step 2: Optional collateral → debt swap ──────────
@@ -394,25 +545,24 @@ contract FlashExecutorV3 is Ownable, ReentrancyGuard, Pausable, IFlashLoanRecipi
         }
 
         // ─── Step 3: Repayment + Profit validation ────────────
-        // Balancer fee is 0 on Arbitrum, but keep the math general
-        uint256 totalOwed = amounts[0] + feeAmounts[0];
+        uint256 totalOwed = principal + fee;
 
         uint256 debtAssetBalanceAfter = IERC20(route.debtAsset).balanceOf(address(this));
 
-        if (debtAssetBalanceAfter < totalOwed + minProfitThreshold) {
-            revert NotProfitable(debtAssetBalanceAfter, totalOwed + minProfitThreshold);
+        uint256 threshold = _minProfitForAsset(route.debtAsset);
+        if (debtAssetBalanceAfter < totalOwed + threshold) {
+            revert NotProfitable(debtAssetBalanceAfter, totalOwed + threshold);
         }
 
         uint256 profit = debtAssetBalanceAfter - totalOwed;
 
-        // Repay Balancer (transfer back; vault checks balances)
-        IERC20(route.debtAsset).safeTransfer(address(BALANCER_VAULT), totalOwed);
+        IERC20(route.debtAsset).safeTransfer(repaymentTarget, totalOwed);
 
         emit LiquidationExecuted(
             route.borrower,
             route.collateralAsset,
             route.debtAsset,
-            route.debtToCover,
+            principal,
             profit,
             block.number
         );

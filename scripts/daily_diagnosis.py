@@ -5,11 +5,11 @@ Runs at 10:00 UTC via cron. Checks actual live state, compares to
 previous findings, proposes file:line fixes for current top bottleneck.
 
 Cron entry:
-    0 10 * * * /root/defi_flash_bot/prod/venv/bin/python3 \
-        /root/defi_flash_bot/prod/scripts/daily_diagnosis.py \
-        >> /root/defi_flash_bot/prod/logs/daily_diagnosis.log 2>&1
+    0 10 * * * /home/ubuntu/defi_flash_bot/venv/bin/python3 \
+        /home/ubuntu/defi_flash_bot/scripts/daily_diagnosis.py \
+        >> /home/ubuntu/defi_flash_bot/logs/daily_diagnosis.log 2>&1
 
-State file: /root/defi_flash_bot/prod/logs/diagnosis_state.json
+State file: /home/ubuntu/defi_flash_bot/logs/diagnosis_state.json
     Tracks previous findings so repeat issues are flagged vs new ones.
 """
 
@@ -29,7 +29,7 @@ from typing import Optional
 # Config
 # ---------------------------------------------------------------------------
 
-PROD_DIR     = Path("/root/defi_flash_bot/prod")
+PROD_DIR     = Path(__file__).resolve().parent.parent
 STATE_FILE   = PROD_DIR / "logs" / "diagnosis_state.json"
 LOG_FILE     = PROD_DIR / "logs" / "daily_diagnosis.log"
 PIPELINE_LOG = PROD_DIR / "logs" / "pipeline_v3.log"
@@ -308,7 +308,7 @@ def analyze_bottleneck(
             description = "Pipeline process not running",
             evidence    = "pgrep pipeline_v3.py returned no results",
             fix         = "systemctl restart pipeline.service  OR  "
-                          "cd /root/defi_flash_bot/prod && "
+                          "cd /home/ubuntu/defi_flash_bot && "
                           "python3 -u services/rev2/pipeline_v3.py &",
         ))
         return findings  # Nothing else matters if pipeline is down

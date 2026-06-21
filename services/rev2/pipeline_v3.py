@@ -48,6 +48,7 @@ from fix_wsteth_staleness import StalenessGatedPricePoller
 from fix_gas_reserve      import GasReserveGuard, GasEstimator
 from fix_min_profit       import ProfitGate
 from outcome_db           import OutcomeDB
+from rpc_provider         import RPCProviderConfig, get_rpc_provider
 from hot_path_fix        import SharedState, FastGasGuard, CachedBaseFeeChecker, LatencyTracker
 from cache_prewarm       import CachePrewarmer, HFChangeDetector
 from skip_telemetry      import SkipTelemetry, SkipEvent, SkipReason
@@ -70,7 +71,12 @@ def _load_gas_config() -> dict:
     Load gas oracle config from calibration file if it exists.
     Falls back to safe defaults if file missing or malformed.
     """
-    config_path = Path("/root/defi_flash_bot/prod/config/gas_oracle.json")
+    # Try prod path first (may not be accessible from this user)
+    try:
+        prod_path = Path("/home/ubuntu/defi_flash_bot/config/gas_oracle.json")
+        config_path = prod_path if prod_path.exists() else Path(__file__).parent.parent.parent / "config" / "gas_oracle.json"
+    except PermissionError:
+        config_path = Path(__file__).parent.parent.parent / "config" / "gas_oracle.json"
     defaults = {
         "percentile":          0.75,
         "surge_buffer":        2.0,
@@ -105,20 +111,42 @@ logging.basicConfig(
 logger = logging.getLogger("pipeline_v3")
 
 # ── Config (from .env) ────────────────────────────────────────
-# Primary: QuickNode Build (paid, 22ms, highest rate limits)
-HTTP_RPC    = os.getenv("QUICKNODE_HTTP_URL", "https://arb1.arbitrum.io/rpc")
-# Secondary: public Arbitrum RPC (free, 52ms, fallback submit)
-HTTP_SECONDARY = os.getenv("DRPC_RPC_URL", "") or "https://arb1.arbitrum.io/rpc"
-# Read-only RPCs (block polling, position refresh — higher rate limits)
-READ_RPC_PRIMARY   = os.getenv("READ_RPC_PRIMARY", os.getenv("QUICKNODE_HTTP_URL", "https://arb1.arbitrum.io/rpc"))
-READ_RPC_SECONDARY = os.getenv("READ_RPC_SECONDARY", os.getenv("CHAINSTACK_HTTP_URL", "https://arb1.arbitrum.io/rpc"))
-PRIMARY_WSS   = os.getenv("CHAINSTACK_ARBITRUM_WS_URL", "")
-SECONDARY_WSS = os.getenv("QUICKNODE_WS_URL", "")  # may 429, WSManager handles
+# Centralised RPC provider selection with health-checked rotation.
+# Priority: 1RPC → PublicNode → BlastAPI → public Arb1
+RPC_CONFIG = RPCProviderConfig.from_env()
+PRIMARY_WSS   = os.getenv("RPC_WSS_URL", "wss://arbitrum-one.publicnode.com")
+SECONDARY_WSS = ""  # only PublicNode supports WSS — HTTP fallback for others
 
 WALLET_ADDR  = os.getenv("BOT_ADDRESS", "0x1269800101780229B50919e1e27be62DC6279e9B")
 PRIVATE_KEY  = os.getenv("BOT_PRIVATE_KEY", "")
 CONTRACT_ADDR = os.getenv("FLASH_EXECUTOR_V3", "0x4CdADEd4749FcB498e7E371EBF00C319674D3F8D")
 AAVE_POOL    = "0x794a61358D6845594F94dc1DB02A252b5b4814aD"
+
+# ── Startup guard: refuse to start with missing/wrong critical env vars ──
+_MISSING_CRITICAL = []
+if not PRIVATE_KEY or PRIVATE_KEY == "":
+    _MISSING_CRITICAL.append("BOT_PRIVATE_KEY")
+if not WALLET_ADDR or WALLET_ADDR == "":
+    _MISSING_CRITICAL.append("BOT_ADDRESS")
+if not os.getenv("FLASH_EXECUTOR_V3"):
+    _MISSING_CRITICAL.append("FLASH_EXECUTOR_V3")
+_MISSING_WARN = []
+if not os.getenv("TELEGRAM_BOT_TOKEN"):
+    _MISSING_WARN.append("TELEGRAM_BOT_TOKEN")
+if not os.getenv("TELEGRAM_CHAT_ID"):
+    _MISSING_WARN.append("TELEGRAM_CHAT_ID")
+if _MISSING_CRITICAL:
+    logger.critical(
+        f"FATAL: Required env vars missing from .env (systemd EnvironmentFile may have failed): "
+        f"{', '.join(_MISSING_CRITICAL)}"
+    )
+    logger.critical("Refusing to start with wrong/missing contract or wallet. Fix .env and restart.")
+    sys.exit(1)
+if _MISSING_WARN:
+    logger.warning(
+        f"WARNING: Optional env vars missing: {', '.join(_MISSING_WARN)} — "
+        f"Telegram alerts disabled"
+    )
 
 # ── Chainlink Feeds ───────────────────────────────────────────
 # feed_address → underlying_asset_address (for price routing)
@@ -183,27 +211,20 @@ class LiquidationPipelineV3:
         logger.info(f"  Wallet: {WALLET_ADDR}")
         logger.info(f"  Contract: {CONTRACT_ADDR}")
         logger.info(f"  Primary WSS: {PRIMARY_WSS[:50]}...")
-        logger.info(f"  HTTP: {HTTP_RPC[:50]}...")
         logger.info("=" * 60)
 
         # ── W4: Async RPC clients ────────────────────────────
-        # Execution RPC — QuickNode 22ms (nonce, submit, gas, QuoterV2)
-        self.rpc = AsyncRPCClient(
-            http_url        = os.getenv("QUICKNODE_HTTP_URL", "https://arb1.arbitrum.io/rpc"),
-            request_timeout = 10.0,
-        )
-        await self.rpc.connect()
-        logger.info(f"  AsyncRPC (exec): QuickNode — block {await self.rpc.get_block_number()}")
+        # Health-checked rotation: Chainstack → DRPC-public → DRPC-lb → Alchemy → public Arb1
+        self.rpc = await get_rpc_provider(RPC_CONFIG, purpose="exec", request_timeout=10.0)
+        logger.info(f"  AsyncRPC (exec): {self.rpc.http_url[:60]}... — block {await self.rpc.get_block_number()}")
 
-        # Read RPC — public arb1 52ms (position loading, bulk Multicall3)
-        # QuickNode handles execution-critical reads, but public arb1 offloads
-        # the heavy bootstrap/refresh_hot Multicall3 batches to save QuickNode CUs.
-        self.rpc_read = AsyncRPCClient(
-            http_url        = os.getenv("READ_RPC_FALLBACK", "https://arb1.arbitrum.io/rpc"),
-            request_timeout = 15.0,  # longer timeout for bulk Multicall3 batches
-        )
-        await self.rpc_read.connect()
-        logger.info(f"  AsyncRPC (read): public arb1 — block {await self.rpc_read.get_block_number()}")
+        # Read RPC — separate client with longer timeout for bulk Multicall3 batches
+        self.rpc_read = await get_rpc_provider(RPC_CONFIG, purpose="read", request_timeout=15.0)
+        logger.info(f"  AsyncRPC (read): {self.rpc_read.http_url[:60]}... — block {await self.rpc_read.get_block_number()}")
+
+        # Light RPC — DRPC-public for price polls, balance checks (avoids burning Chainstack rate limits)
+        self.rpc_light = await get_rpc_provider(RPC_CONFIG, purpose="light", request_timeout=10.0)
+        logger.info(f"  AsyncRPC (light): {self.rpc_light.http_url[:60]}... — block {await self.rpc_light.get_block_number()}")
 
         # ── W5: Nonce manager ───────────────────────────────
         self.nonce_mgr = NonceManager(self.rpc.w3, WALLET_ADDR)
@@ -214,7 +235,7 @@ class LiquidationPipelineV3:
 
         # ── PricePoller: HTTP fallback for Chainlink feeds (fixes 4/8 → 8/8) ──
         self.price_poller = StalenessGatedPricePoller(
-            rpc=self.rpc_read,
+            rpc=self.rpc_light,
             price_registry=self.prices,
             feeds=PP_FEEDS,
             poll_interval=30,
@@ -224,7 +245,7 @@ class LiquidationPipelineV3:
 
         # ── W10-bis: wstETH price manager (composition + Balancer fallback) ──
         self.wsteth_mgr = WstETHPriceManager(
-            rpc           = self.rpc_read,
+            rpc           = self.rpc_light,
             price_reg     = self.prices,
             poll_interval = 30,
         )
@@ -232,7 +253,10 @@ class LiquidationPipelineV3:
         logger.info(f"  wstETH: {self.wsteth_mgr.status()}")
 
         # ── Profit gate: rejects sub-$5 liquidations before blast_submit ──
-        self.profit_gate = ProfitGate(min_profit_usd=5.0, gas_cost_usd=0.10)
+        self.profit_gate = ProfitGate(
+            min_profit_usd=float(os.getenv("MIN_PROFIT_USD_ARBITRUM", "10.0")),
+            gas_cost_usd=0.10,
+        )
 
         # ── Hot path optimization: SharedState + FastGasGuard (0ms RAM reads) ──
         self.shared_state = SharedState()
@@ -341,8 +365,8 @@ class LiquidationPipelineV3:
         compound_executor = os.getenv("COMPOUND_EXECUTOR_ADDR", "")
         if compound_executor:
             self.compound = CompoundV3Module(
-                rpc           = self.rpc_read,   # public arb1 — avoids Alchemy CU burn
-                rpc_read      = self.rpc_read,
+                rpc           = self.rpc_light,  # DRPC-public — avoids Chainstack rate limits
+                rpc_read      = self.rpc_light,
                 redis         = redis_async,
                 shared_state  = self.shared_state,
                 nonce_mgr     = self.nonce_mgr,
@@ -352,11 +376,10 @@ class LiquidationPipelineV3:
                 private_key   = PRIVATE_KEY,
                 wallet        = WALLET_ADDR,
                 markets       = COMPOUND_MARKETS,
-                min_profit_usd= 2.0,
+                min_profit_usd= float(os.getenv("MIN_PROFIT_USD_COMPOUND", "3.0")),
                 check_interval= 10,
             )
             await self.compound.start()
-            logger.info(self.compound.status())
         else:
             self.compound = None
             logger.warning("  COMPOUND_EXECUTOR_ADDR not set — Compound V3 disabled")
@@ -373,7 +396,7 @@ class LiquidationPipelineV3:
                 executor_addr = base_executor,
                 executor_abi  = self.flash_builder._executor.abi if hasattr(self.flash_builder, '_executor') else [],
                 skip_tel      = self.skip_tel,
-                min_profit_usd = 2.0,
+                min_profit_usd = float(os.getenv("MIN_PROFIT_USD_BASE", "3.0")),
                 price_registry = self.prices,
             )
             try:
@@ -402,12 +425,12 @@ class LiquidationPipelineV3:
         # 3 arb1 slots fire the same tx to the same node (deduplicated),
         # giving 3 parallel network paths at no cost. Only first to land wins.
         configure_endpoints(
-            primary_rpc    = os.getenv("QUICKNODE_HTTP_URL", "https://arb1.arbitrum.io/rpc"),
-            secondary_rpc  = "https://arb1.arbitrum.io/rpc",
+            primary_rpc    = self.rpc.http_url,
+            secondary_rpc  = self.rpc_read.http_url,
             mev_blocker_url= "https://arb1.arbitrum.io/rpc",
             flashbots_url  = "https://arb1.arbitrum.io/rpc",
         )
-        logger.info("  BlastSubmit: QuickNode (22ms) + 3x arb1 (52ms) configured")
+        logger.info(f"  BlastSubmit: {self.rpc.http_url[:40]}... + {self.rpc_read.http_url[:40]}... configured")
 
         # ── W7: Dual WS manager ─────────────────────────────
         self._new_block_event = asyncio.Event()
@@ -416,7 +439,7 @@ class LiquidationPipelineV3:
         self.ws = WSManager(
             primary_wss=PRIMARY_WSS,
             secondary_wss=SECONDARY_WSS,
-            http_rpc=HTTP_RPC,
+            http_rpc=self.rpc.http_url,
             on_price_update=self._on_price_update,
             on_liquidation=self._handle_liquidation_log,
             oracle_feeds=CHAINLINK_FEED_ADDRESSES,
@@ -491,19 +514,19 @@ class LiquidationPipelineV3:
         finally:
             await self.shutdown()
 
-    async def _build_and_cache_one(self, borrower: str) -> bool:
+    async def _build_and_cache_one(self, borrower: str) -> tuple[bool, float]:
         """
         Build and cache a presigned flash loan tx for pre-warming.
         Called by CachePrewarmer every 25s for top-20 lowest-HF positions.
-        Returns True on success, False on any failure.
+        Returns (success, estimated_profit_usd) — profit is 0.0 on failure.
         """
         try:
             account_data = self.loader.get(borrower)
             if account_data is None:
-                return False
+                return (False, 0.0)
 
             if not account_data.reserves:
-                return False    # needs refresh_hot(HF<1.05) first
+                return (False, 0.0)    # needs refresh_hot(HF<1.05) first
 
             # ── Select best collateral via CollateralSelector ───────────
             prices = self.prices.snapshot() if hasattr(self.prices, 'snapshot') else {}
@@ -516,7 +539,7 @@ class LiquidationPipelineV3:
                 asset_decimals   = decimals,
             )
             if result is None:
-                return False
+                return (False, 0.0)
 
             best_c        = result.asset
             debt_to_cover = result.debt_to_cover
@@ -528,7 +551,7 @@ class LiquidationPipelineV3:
             # ── Select best debt asset ──────────────────────────────────
             best_d = self._select_best_debt_asset(account_data)
             if best_d is None:
-                return False
+                return (False, 0.0)
 
             # ── Build flash loan tx (nonce=0 placeholder) ───────────────
             tx_data = await self.flash_builder.build(
@@ -545,7 +568,7 @@ class LiquidationPipelineV3:
             )
 
             if tx_data is None:
-                return False
+                return (False, 0.0)
 
             # ── Sanity-check profit estimate ────────────────────────────
             # Skip implausible cross-asset quotes (>$10K likely corrupted QuoterV2).
@@ -556,7 +579,7 @@ class LiquidationPipelineV3:
                     f"${tx_data.estimated_profit_usd:,.0f} for {borrower[:10]}… — "
                     f"skipping cache (likely bad quote)"
                 )
-                return False
+                return (False, 0.0)
 
             # ── Cache ────────────────────────────────────────────────────
             from execution_guards import PresignedSnapshot
@@ -568,11 +591,11 @@ class LiquidationPipelineV3:
                 collateral_asset = best_c,
                 debt_asset       = best_d,
             )
-            return True
+            return (True, tx_data.estimated_profit_usd)
 
         except Exception as e:
             logger.debug(f"[Prewarm] build failed {borrower[:10]}: {e}")
-            return False
+            return (False, 0.0)
 
     # ── Helper: select best debt asset ───────────────────────
 
@@ -715,19 +738,37 @@ class LiquidationPipelineV3:
                 ))
                 return
 
+            # Flash fee-aware profit gate — check flash source and deduct fee BEFORE gate
+            debt_asset_addr = self._select_best_debt_asset(account_data)
+            source = 'balancer'
+            if debt_asset_addr:
+                source = await self.flash_builder.choose_flash_source(
+                    debt_asset_addr, selection.debt_to_cover
+                )
+            # Aave fee = 9 bps of debt. Gross profit = debt × liq_bonus (typically 5%).
+            # Ratio: fee/profit ≈ 0.0009/0.05 = 0.018. Safe for gate-check purposes.
+            flash_fee_usd = selection.expected_profit_usd * 0.018 if source == 'aave' else 0.0
+            net_profit_usd = selection.expected_profit_usd - flash_fee_usd
+
             logger.info(
                 f"[Pipeline] GO {address[:10]}… HF={hf:.4f} "
-                f"EV≈${selection.expected_profit_usd:.2f} "
+                f"gross=${selection.expected_profit_usd:.2f} "
+                f"net=${net_profit_usd:.2f} "
+                f"source={source} fee=${flash_fee_usd:.2f} "
                 f"collateral={selection.symbol} debtToCover={selection.debt_to_cover}"
             )
 
-            # Profit gate — reject dust liquidations (< $5)
-            if not self.profit_gate.check(selection.expected_profit_usd):
+            # Profit gate — reject dust liquidations
+            if not self.profit_gate.check(net_profit_usd):
+                logger.info(
+                    f"[Skip] {address[:10]}… net=${net_profit_usd:.2f} after {source} "
+                    f"fee=${flash_fee_usd:.2f} — below ${self.profit_gate.min_profit_usd:.2f} floor"
+                )
                 self.skip_tel.record(SkipEvent(
                     borrower=address, reason=SkipReason.PROFIT_FLOOR,
                     hf=hf,
-                    profit_usd=selection.expected_profit_usd,
-                    gas_usd=0.10,  # from ProfitGate config
+                    profit_usd=net_profit_usd,
+                    gas_usd=0.10,
                     collateral=selection.asset,
                     debt_asset=selection.symbol,
                     debt_usd=debt_usd,
@@ -751,6 +792,7 @@ class LiquidationPipelineV3:
             tx_hash = await self._build_and_submit(
                 address, selection.asset, selection.debt_to_cover,
                 estimated_profit=selection.expected_profit_usd,
+                asset_prices_usd=asset_prices_usd,
             )
 
             if tx_hash:
@@ -785,6 +827,7 @@ class LiquidationPipelineV3:
     async def _build_and_submit(
         self, borrower: str, collateral_asset: str, debt_to_cover: int,
         estimated_profit: float = 0.0, debt_asset: str = "",
+        asset_prices_usd: dict = None,
     ) -> Optional[str]:
         """
         Flash-first submission path.
@@ -846,6 +889,8 @@ class LiquidationPipelineV3:
                 debt_to_cover     = debt_to_cover,
                 shared_state      = self.shared_state,
                 nonce             = nonce,
+                asset_prices_usd  = asset_prices_usd or {},
+                asset_decimals    = DECIMALS,
             )
 
             if tx_data is not None:
@@ -982,7 +1027,7 @@ class LiquidationPipelineV3:
                     addr: balances.get(ASSET_SYMBOLS.get(addr, ""), 0)
                     for addr in DECIMALS
                 }
-                eth_bal = await self.rpc_read.w3.eth.get_balance(WALLET_ADDR)
+                eth_bal = await self.rpc_light.w3.eth.get_balance(WALLET_ADDR)
                 self.shared_state.on_balance_update(eth_bal)
                 logger.info(
                     f"[Wallet] ETH={eth_bal/1e18:.4f} "
@@ -1232,7 +1277,9 @@ class LiquidationPipelineV3:
         if self.base is None:
             return
         logger.info("[BaseBlock] Starting Base chain block poller")
-        last_block = 0
+        # Seed from current block to avoid replaying entire chain history
+        last_block = max(0, await self.base._rpc.get_block_number() - 1)
+        logger.info(f"[BaseBlock] Starting from block {last_block}")
         while not self._shutdown.is_set():
             try:
                 block = await self.base._rpc.get_block_number()
