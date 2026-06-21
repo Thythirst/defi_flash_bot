@@ -56,13 +56,14 @@ def configure_endpoints(
         flashbots_url:   public arb1 (Ethereum-only Flashbots replaced)
     """
     global _ENDPOINTS
+    public_arb1 = "https://arb1.arbitrum.io/rpc"
     _ENDPOINTS = [
-        Endpoint(name="quicknode",  url=primary_rpc,    timeout_ms=500),
-        Endpoint(name="arb1_a",     url=secondary_rpc,  timeout_ms=1000),
-        Endpoint(name="arb1_b",     url=secondary_rpc,  timeout_ms=1000),
-        Endpoint(name="arb1_c",     url=secondary_rpc,  timeout_ms=1000),
+        Endpoint(name="primary",    url=primary_rpc,    timeout_ms=5000),
+        Endpoint(name="secondary",  url=secondary_rpc,  timeout_ms=5000),
+        Endpoint(name="arb1_a",     url=public_arb1,    timeout_ms=5000),
+        Endpoint(name="arb1_b",     url=public_arb1,    timeout_ms=5000),
     ]
-    logger.info(f"[BlastSubmit] Configured {len(_ENDPOINTS)} endpoints: quicknode + 3x arb1")
+    logger.info(f"[BlastSubmit] Configured {len(_ENDPOINTS)} endpoints: primary({primary_rpc[:40]}) + secondary + 2x arb1")
 
 
 async def _get_session() -> aiohttp.ClientSession:
