@@ -523,6 +523,15 @@ class LiquidationPipelineV3:
 
         # Re-scan HF engine for positions that were underwater during setup
         # (suppressed by _setup_complete guard). These need immediate action.
+        # Wait for at least 4 Chainlink prices before triggering — post-setup runs
+        # before PricePoller has completed its first poll, causing _select_best_debt_asset
+        # to return None for all debt assets (no prices → no selection → wasted attempt).
+        price_wait_start = __import__("time").monotonic()
+        while len(self.prices.snapshot()) < 4 and __import__("time").monotonic() - price_wait_start < 45:
+            await asyncio.sleep(2)
+        n_prices = len(self.prices.snapshot())
+        logger.info(f"[Pipeline] Post-setup scan starting — {n_prices} prices available")
+
         for addr, pos in list(self.hf_engine.positions.items()):
             total_debt = sum(pos.debt.values())
             if total_debt > 0:
@@ -646,24 +655,37 @@ class LiquidationPipelineV3:
         """
         Select the debt asset with highest USD value from account reserves.
         Returns checksummed address or None if no debt found.
+        Falls back to highest raw debt amount when prices are unavailable.
         """
-        best_asset = None
-        best_usd   = 0.0
-        decimals   = DECIMALS
+        best_asset    = None
+        best_usd      = 0.0
+        fallback_asset = None
+        fallback_raw  = 0
+        decimals      = DECIMALS
 
         for reserve in account_data.reserves:
             if reserve.total_debt == 0:
                 continue
             price = self.prices.get_price(reserve.asset)
-            if price is None:
-                continue
             dec = decimals.get(reserve.asset, 18)
-            usd = (reserve.total_debt / 10 ** dec) * (price / 1e8)
-            if usd > best_usd:
-                best_usd   = usd
-                best_asset = reserve.asset
+            if price is not None:
+                usd = (reserve.total_debt / 10 ** dec) * (price / 1e8)
+                if usd > best_usd:
+                    best_usd   = usd
+                    best_asset = reserve.asset
+            else:
+                # Price not available — track by raw normalised amount as fallback
+                normalised = reserve.total_debt / 10 ** dec
+                if normalised > fallback_raw:
+                    fallback_raw  = normalised
+                    fallback_asset = reserve.asset
 
-        return best_asset
+        if best_asset is not None:
+            return best_asset
+        if fallback_asset is not None:
+            logger.debug(f"[DebtSelect] No price for debt assets — using fallback {fallback_asset[:10]}…")
+            return fallback_asset
+        return None
 
     async def _aave_oracle_price_loop(self) -> None:
         """
