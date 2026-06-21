@@ -574,17 +574,27 @@ class LiquidationPipelineV3:
             if result is None:
                 return (False, 0.0)
 
-            best_c        = result.asset
-            debt_to_cover = result.debt_to_cover
-
-            # Estimate collateral amount received (debt × bonus multiplier)
-            bonus_mult        = result.liquidation_bonus_bps / 10_000
-            collateral_amount = int(debt_to_cover * bonus_mult)
+            best_c = result.asset
 
             # ── Select best debt asset ──────────────────────────────────
             best_d = self._select_best_debt_asset(account_data)
             if best_d is None:
                 return (False, 0.0)
+
+            # CollateralSelector returns debt_to_cover in collateral-asset units
+            # (collatoral decimals / collateral price) — wrong for cross-asset liquidations.
+            # Recompute here using debt asset's price and decimals so debtToCover is correct.
+            debt_price_raw = prices.get(best_d, 0)
+            debt_dec       = DECIMALS.get(best_d, 18)
+            if debt_price_raw > 0:
+                debt_to_cover_usd = account_data.total_debt_base / 1e8 * result.close_factor
+                debt_to_cover = int(debt_to_cover_usd / (debt_price_raw / 1e8) * (10 ** debt_dec))
+            else:
+                debt_to_cover = result.debt_to_cover  # fallback to selector's estimate
+
+            # Estimate collateral amount received (debt × bonus multiplier)
+            bonus_mult        = result.liquidation_bonus_bps / 10_000
+            collateral_amount = int(debt_to_cover * bonus_mult)
 
             # ── Build flash loan tx (nonce=0 placeholder) ───────────────
             tx_data = await self.flash_builder.build(
@@ -808,10 +818,22 @@ class LiquidationPipelineV3:
 
             # Flash fee-aware profit gate — check flash source and deduct fee BEFORE gate
             debt_asset_addr = self._select_best_debt_asset(account_data)
+
+            # CollateralSelector returns debt_to_cover in collateral-asset units.
+            # Recompute in debt-asset units now that we know the debt asset.
+            prices_snap = self.prices.snapshot() if hasattr(self.prices, 'snapshot') else {}
+            debt_price_raw = prices_snap.get(debt_asset_addr, 0) if debt_asset_addr else 0
+            debt_dec = DECIMALS.get(debt_asset_addr, 18) if debt_asset_addr else 18
+            if debt_asset_addr and debt_price_raw > 0:
+                dtc_usd = debt_usd * selection.close_factor
+                corrected_dtc = int(dtc_usd / (debt_price_raw / 1e8) * (10 ** debt_dec))
+            else:
+                corrected_dtc = selection.debt_to_cover
+
             source = 'balancer'
             if debt_asset_addr:
                 source = await self.flash_builder.choose_flash_source(
-                    debt_asset_addr, selection.debt_to_cover
+                    debt_asset_addr, corrected_dtc
                 )
             # Aave fee = 9 bps of debt. Gross profit = debt × liq_bonus (typically 5%).
             # Ratio: fee/profit ≈ 0.0009/0.05 = 0.018. Safe for gate-check purposes.
@@ -823,7 +845,7 @@ class LiquidationPipelineV3:
                 f"gross=${selection.expected_profit_usd:.2f} "
                 f"net=${net_profit_usd:.2f} "
                 f"source={source} fee=${flash_fee_usd:.2f} "
-                f"collateral={selection.symbol} debtToCover={selection.debt_to_cover}"
+                f"collateral={selection.symbol} debtToCover={corrected_dtc}"
             )
 
             # Profit gate — reject dust liquidations
@@ -858,7 +880,7 @@ class LiquidationPipelineV3:
 
             # Build and submit tx
             tx_hash = await self._build_and_submit(
-                address, selection.asset, selection.debt_to_cover,
+                address, selection.asset, corrected_dtc,
                 estimated_profit=selection.expected_profit_usd,
                 asset_prices_usd=asset_prices_usd,
             )
