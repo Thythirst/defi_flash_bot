@@ -356,6 +356,7 @@ class LiquidationPipelineV3:
         # Prime reserves for pre-warm targets — refresh_hot populates per-asset breakdown
         hot_count = await self.loader.refresh_hot(hf_threshold=1.2)
         logger.info(f"  PositionLoader: {hot_count} positions below HF 1.2 (reserves primed)")
+        self._sync_hf_engine()  # populate LocalHFEngine with primed per-asset data
 
         # ── W11: Collateral selector ────────────────────────
         self.selector = CollateralSelector(
@@ -1253,36 +1254,43 @@ class LiquidationPipelineV3:
     # ── Helpers ──────────────────────────────────────────────
 
     def _sync_hf_engine(self):
-        """Sync PositionLoader data into LocalHFEngine."""
+        """
+        Sync PositionLoader data into LocalHFEngine.
+
+        Previously only synced HF<1.0 positions. Now syncs ALL positions that
+        have per-asset reserve data populated (from _batch_reserve_data). This
+        enables LocalHFEngine to track price-move triggers for positions in the
+        HF 1.0-1.2 range, not just already-liquidatable dust positions.
+        """
         from web3 import Web3
         for addr in list(self.hf_engine.positions.keys()):
             if self.loader.get(addr) is None:
                 self.hf_engine.remove_position(addr)
 
-        liquidatable = self.loader.liquidatable
-        for pos in liquidatable:
-            if pos.address not in self.hf_engine.positions:
-                # Build collateral/debt maps from reserves
-                coll = {}
-                debt = {}
-                thresholds = {}
-                bonuses = {}
-                for r in pos.reserves:
-                    if r.a_token_balance > 0 and r.usage_as_collateral:
-                        coll[r.asset] = r.a_token_balance
-                        cfg = self.loader.get_reserve_config(r.asset)
-                        thresholds[r.asset] = (cfg.liquidation_threshold / 10000) if cfg else 0.8
-                        bonuses[r.asset] = ((cfg.liquidation_bonus / 10000) - 1) if cfg else 0.05
-                    if r.total_debt > 0:
-                        debt[r.asset] = r.total_debt
-                if coll and debt:
-                    self.hf_engine.upsert_position(
-                        address=pos.address,
-                        collateral=coll,
-                        debt=debt,
-                        liq_threshold=thresholds,
-                        liq_bonus=bonuses,
-                    )
+        for pos in self.loader._positions.values():
+            if not pos.reserves or pos.total_debt_base == 0:
+                continue    # skip positions without per-asset data
+            # Build collateral/debt maps from reserves
+            coll = {}
+            debt = {}
+            thresholds = {}
+            bonuses = {}
+            for r in pos.reserves:
+                if r.a_token_balance > 0 and r.usage_as_collateral:
+                    coll[r.asset] = r.a_token_balance
+                    cfg = self.loader.get_reserve_config(r.asset)
+                    thresholds[r.asset] = (cfg.liquidation_threshold / 10000) if cfg else 0.8
+                    bonuses[r.asset] = ((cfg.liquidation_bonus / 10000) - 1) if cfg else 0.05
+                if r.total_debt > 0:
+                    debt[r.asset] = r.total_debt
+            if coll and debt:
+                self.hf_engine.upsert_position(
+                    address=pos.address,
+                    collateral=coll,
+                    debt=debt,
+                    liq_threshold=thresholds,
+                    liq_bonus=bonuses,
+                )
 
     def _csv_fallback_addresses(self) -> list:
         """Fallback: load addresses from classification CSV if Redis unavailable."""
