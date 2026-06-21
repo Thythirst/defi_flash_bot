@@ -64,10 +64,15 @@ class RPCProviderConfig:
         blastapi  = Provider("BlastAPI",  rpc_blastapi)
         public_arb= Provider("PublicArb1", rpc_public_arb, timeout=5.0)
 
-        exec_list   = [p for p in [blastapi, publicnode, public_arb] if p]
-        read_list   = [p for p in [drpc, blastapi, public_arb] if p]
+        # Tier separation to avoid both exec and read landing on the same provider:
+        #   exec  → DRPC first: small eth_calls (nonce, gas, TX send) are fine on DRPC
+        #   read  → BlastAPI:   large Multicall3 bootstrap — BlastAPI handles payloads
+        #   light → PublicNode: price polls at low frequency
+        # DRPC returns 500 on large Multicall3 batches (bootstrap) but handles small calls.
+        exec_list   = [p for p in [drpc, blastapi, public_arb] if p]
+        read_list   = [p for p in [blastapi, public_arb] if p]
         light_list  = [p for p in [publicnode, public_arb] if p]
-        submit_list = [p for p in [blastapi, publicnode, public_arb] if p]
+        submit_list = [p for p in [drpc, blastapi, public_arb] if p]
 
         return cls(
             exec_providers=exec_list,

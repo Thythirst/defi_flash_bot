@@ -380,7 +380,7 @@ class PositionLoader:
                 if '429' in err_str:
                     await asyncio.sleep(3.0)
                 continue
-            await asyncio.sleep(0.1)  # rate-limit guard
+            await asyncio.sleep(0.3)  # rate-limit guard — ~3 req/s during bootstrap
 
             for addr, (success, raw) in zip(chunk, results):
                 if not success or not raw:
