@@ -45,26 +45,35 @@ class RPCProviderConfig:
     def from_env(cls) -> "RPCProviderConfig":
         """Build config from environment variables.
 
-        Rotation (all tiers): 1RPC → PublicNode → BlastAPI → PublicArb1
-        Chainstack, Alchemy, DRPC removed — all monthly quotas exhausted or 500 on eth_call.
-        """
-        rpc_1rpc       = os.getenv("RPC_1RPC",        "https://1rpc.io/arb")
-        rpc_publicnode = os.getenv("RPC_PUBLICNODE",   "https://arbitrum-one.publicnode.com")
-        rpc_blastapi   = os.getenv("RPC_BLASTAPI",     "https://arbitrum-one.public.blastapi.io")
-        rpc_public_arb = os.getenv("RPC_PUBLIC_ARB1",  "https://arb1.arbitrum.io/rpc")
+        Tier priorities (intentionally different to spread RPC load):
+          exec  : BlastAPI → PublicNode → arb1   (low-latency tx submission)
+          read  : DRPC → BlastAPI → arb1          (heavy Multicall3 — DRPC has higher rate limits)
+          light : PublicNode → arb1               (price polls, balance checks — keep Multicall3 on DRPC)
+          submit: BlastAPI → PublicNode → arb1    (TX broadcast)
 
-        providers = [
-            Provider("1RPC",        rpc_1rpc),
-            Provider("PublicNode",  rpc_publicnode),
-            Provider("BlastAPI",    rpc_blastapi),
-            Provider("PublicArb1",  rpc_public_arb, timeout=5.0),
-        ]
+        1RPC excluded — quota exhausted (403 on eth_call).
+        Chainstack excluded — monthly quota exhausted (403).
+        """
+        rpc_drpc       = os.getenv("READ_RPC_PRIMARY",  "")   # DRPC lb — high rate limits
+        rpc_publicnode = os.getenv("RPC_PUBLICNODE",    "https://arbitrum-one.publicnode.com")
+        rpc_blastapi   = os.getenv("RPC_BLASTAPI",      "https://arbitrum-one.public.blastapi.io")
+        rpc_public_arb = os.getenv("RPC_PUBLIC_ARB1",   "https://arb1.arbitrum.io/rpc")
+
+        drpc      = Provider("DRPC",      rpc_drpc,       timeout=5.0) if rpc_drpc else None
+        publicnode= Provider("PublicNode", rpc_publicnode)
+        blastapi  = Provider("BlastAPI",  rpc_blastapi)
+        public_arb= Provider("PublicArb1", rpc_public_arb, timeout=5.0)
+
+        exec_list   = [p for p in [blastapi, publicnode, public_arb] if p]
+        read_list   = [p for p in [drpc, blastapi, public_arb] if p]
+        light_list  = [p for p in [publicnode, public_arb] if p]
+        submit_list = [p for p in [blastapi, publicnode, public_arb] if p]
 
         return cls(
-            exec_providers=list(providers),
-            read_providers=list(providers),
-            light_providers=list(providers),
-            submit_providers=list(providers),
+            exec_providers=exec_list,
+            read_providers=read_list,
+            light_providers=light_list,
+            submit_providers=submit_list,
             health_check_timeout=3.0,
         )
 

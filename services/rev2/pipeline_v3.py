@@ -438,7 +438,7 @@ class LiquidationPipelineV3:
 
         self.ws = WSManager(
             primary_wss=PRIMARY_WSS,
-            secondary_wss=SECONDARY_WSS,
+            secondary_wss=SECONDARY_WSS or None,   # empty string → None so WSManager skips it
             http_rpc=self.rpc.http_url,
             on_price_update=self._on_price_update,
             on_liquidation=self._handle_liquidation_log,
