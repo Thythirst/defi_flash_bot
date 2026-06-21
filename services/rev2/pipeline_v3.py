@@ -977,6 +977,21 @@ class LiquidationPipelineV3:
             ))
             return None
 
+        # Skip same-asset liquidations (collateral == debt). The FlashExecutorV3
+        # always routes through Uni V3 swap (collateral → debt); when both assets
+        # are identical, Uni V3 has no same-token pool (fee_tier=0 invalid) and
+        # the on-chain TX reverts. Requires contract update to handle.
+        if best_debt_asset.lower() == collateral_asset.lower():
+            logger.debug(
+                f"[Submit] Skipping same-asset liquidation {borrower[:10]}… "
+                f"(collateral==debt={collateral_asset[:10]}…)"
+            )
+            self.skip_tel.record(SkipEvent(
+                borrower=borrower, reason=SkipReason.BUILD_FAILED,
+                detail="same-asset liquidation (collateral==debt) — contract unsupported",
+            ))
+            return None
+
         nonce = await self.nonce_mgr.next()
 
         # ── CACHE HIT — re-sign with fresh nonce, zero RPC ───────────
