@@ -114,8 +114,8 @@ logger = logging.getLogger("pipeline_v3")
 # Centralised RPC provider selection with health-checked rotation.
 # Priority: 1RPC → PublicNode → BlastAPI → public Arb1
 RPC_CONFIG = RPCProviderConfig.from_env()
-PRIMARY_WSS   = os.getenv("RPC_WSS_URL", "wss://arbitrum-one.publicnode.com")
-SECONDARY_WSS = ""  # only PublicNode supports WSS — HTTP fallback for others
+PRIMARY_WSS   = os.getenv("ARBITRUM_WS_URL") or os.getenv("RPC_WSS_URL", "wss://arbitrum-one.publicnode.com")
+SECONDARY_WSS = os.getenv("RPC_WSS_URL", "wss://arbitrum-one.publicnode.com") if os.getenv("ARBITRUM_WS_URL") else ""
 
 WALLET_ADDR  = os.getenv("BOT_ADDRESS", "0x1269800101780229B50919e1e27be62DC6279e9B")
 PRIVATE_KEY  = os.getenv("BOT_PRIVATE_KEY", "")
