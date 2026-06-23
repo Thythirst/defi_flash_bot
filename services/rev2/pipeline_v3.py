@@ -497,6 +497,7 @@ class LiquidationPipelineV3:
 
         # ── W7: Dual WS manager ─────────────────────────────
         self._new_block_event = asyncio.Event()
+        self._arb_block_event = asyncio.Event()
         self._new_block_number = 0
 
         self.ws = WSManager(
@@ -576,10 +577,10 @@ class LiquidationPipelineV3:
             asyncio.create_task(self._wallet_balance_loop(), name="wallet"),
             asyncio.create_task(self._stats_loop(), name="stats"),
             asyncio.create_task(self._aave_oracle_price_loop(), name="aave_oracle"),
-            # _presigner_loop disabled — CachePrewarmer replaces it with HF<1.15 coverage
-            # asyncio.create_task(self._presigner_loop(), name="presigner"),
             asyncio.create_task(self._shutdown_waiter(), name="shutdown"),
         ]
+        if self._arb_scanner is not None:
+            tasks.append(asyncio.create_task(self._arb_loop(), name="arb_scan"))
         try:
             await asyncio.gather(*tasks)
         except asyncio.CancelledError:
@@ -775,6 +776,7 @@ class LiquidationPipelineV3:
         """Called by WSManager on each new block via newHeads subscription."""
         self._new_block_number = block_number
         self._new_block_event.set()
+        self._arb_block_event.set()
 
     # ── Price update callback (W9 + W7) ─────────────────────
 
@@ -1155,24 +1157,6 @@ class LiquidationPipelineV3:
                 if self.compound is not None:
                     await self.compound.on_new_block(current)
 
-                # DEX-DEX arbitrage scan (every block)
-                if self._arb_scanner is not None:
-                    try:
-                        opp = await self._arb_scanner.scan_once()
-                        if opp and opp.is_profitable():
-                            nonce = await self.nonce_mgr.next()
-                            tx_hash = await self._arb_executor.execute(
-                                opp,
-                                self._arb_multi_dex,
-                                nonce=nonce,
-                                dry_run=self._arb_dry_run,
-                            )
-                            if tx_hash:
-                                logger.info(f"[Arb] Submitted: {tx_hash}")
-                            elif not self._arb_dry_run:
-                                await self.nonce_mgr.rewind()
-                    except Exception as _arb_e:
-                        logger.warning(f"[Arb] scan/execute error: {_arb_e}")
 
                 # Three-tier position refresh — tuned for free-tier RPC rate limits
                 # (Arbitrum ~250ms/block: 30 blocks≈7.5s, 120 blocks≈30s, 400 blocks≈100s)
@@ -1308,6 +1292,35 @@ class LiquidationPipelineV3:
                     logger.info(f"[Presigner] Refreshed {refreshed} presigned txs")
             except Exception as e:
                 logger.error(f"[Presigner] Refresh error: {e}")
+
+    async def _arb_loop(self):
+        """Dedicated arb scan loop — decoupled from block loop for max throughput."""
+        while not self._shutdown.is_set():
+            try:
+                # Wake on new block or every 250ms (one block time) as fallback
+                try:
+                    await asyncio.wait_for(self._arb_block_event.wait(), timeout=0.25)
+                    self._arb_block_event.clear()
+                except asyncio.TimeoutError:
+                    pass
+
+                opp = await self._arb_scanner.scan_once()
+                if opp and opp.is_profitable():
+                    nonce = await self.nonce_mgr.next()
+                    tx_hash = await self._arb_executor.execute(
+                        opp,
+                        self._arb_multi_dex,
+                        nonce=nonce,
+                        dry_run=self._arb_dry_run,
+                    )
+                    if tx_hash:
+                        logger.info(f"[Arb] Submitted: {tx_hash}")
+                    elif not self._arb_dry_run:
+                        await self.nonce_mgr.rewind()
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.warning(f"[Arb] scan/execute error: {e}")
 
     async def _stats_loop(self):
         while not self._shutdown.is_set():
