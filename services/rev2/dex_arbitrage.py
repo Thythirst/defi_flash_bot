@@ -65,11 +65,11 @@ BALANCER_VAULT = "0xBA12222222228d8Ba445958a75a0704d566BF2C8"
 # Each entry: (token_a, token_b, test_size_a)
 # test_size is the probe amount — actual size scales to available liquidity
 MONITORED_PAIRS = [
-    (WETH, USDC, int(1e18)),      # 1 WETH probe
-    (WETH, USDT, int(1e18)),
-    (ARB,  USDC, int(1000e18)),   # 1000 ARB probe
-    (WBTC, USDC, int(int(0.05e8))), # 0.05 WBTC probe
-    (WBTC, WETH, int(int(0.05e8))),
+    (WETH, USDC, int(1e18)),        # 1 WETH probe
+    (ARB,  USDC, int(1000e18)),     # 1000 ARB probe
+    (WBTC, WETH, int(0.05e8)),      # 0.05 WBTC probe
+    # WETH/USDT removed — Camelot pool too thin, always shows -4%+ spread
+    # WBTC/USDC removed — no real Camelot pool, returns garbage quote (~$14 for $5250)
 ]
 
 # Minimum profit threshold — must clear this after all costs
