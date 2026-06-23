@@ -441,6 +441,37 @@ class LiquidationPipelineV3:
             self.base = None
             logger.warning("  BASE_EXECUTOR_ADDR not set — Base chain disabled")
 
+        # ── DEX-DEX arbitrage (ArbExecutor.sol) ─────────────
+        arb_executor_addr = os.getenv("ARB_EXECUTOR_ADDR", "")
+        if arb_executor_addr:
+            from multi_dex_router import MultiDexRouter
+            from dex_arbitrage import ArbitrageScanner, ArbExecutor as DexArbExecutor
+
+            self._arb_multi_dex = MultiDexRouter(self.rpc.w3, arb_executor_addr)
+            self._arb_scanner = ArbitrageScanner(
+                multi_dex     = self._arb_multi_dex,
+                shared_state  = self.shared_state,
+                price_reg     = self.prices,
+                min_profit_usd= float(os.getenv("MIN_PROFIT_USD", "5.0")),
+            )
+            self._arb_executor = DexArbExecutor(
+                w3                   = self.rpc.w3,
+                arb_executor_address = arb_executor_addr,
+                wallet               = WALLET_ADDR,
+                private_key          = PRIVATE_KEY,
+                shared_state         = self.shared_state,
+            )
+            self._arb_dry_run = os.getenv("ARB_DRY_RUN", "1") == "1"
+            await self._arb_executor.warmup()
+            logger.info(
+                f"  DexArb: scanner + executor ready "
+                f"(contract={arb_executor_addr[:10]}… dry_run={self._arb_dry_run})"
+            )
+        else:
+            self._arb_scanner  = None
+            self._arb_executor = None
+            logger.warning("  ARB_EXECUTOR_ADDR not set — DEX arb disabled")
+
         # ── HF Engine ───────────────────────────────────────
         self.hf_engine = LocalHFEngine(
             on_liquidatable=self._on_liquidatable,
@@ -992,10 +1023,12 @@ class LiquidationPipelineV3:
             ))
             return None
 
-        nonce = await self.nonce_mgr.next()
+        nonce: Optional[int] = None
+        raw_tx: Optional[bytes] = None
 
         # ── CACHE HIT — re-sign with fresh nonce, zero RPC ───────────
         if cached is not None:
+            nonce = await self.nonce_mgr.next()
             tx_data = await self.flash_builder.rebuild_with_nonce(cached, nonce)
             if tx_data:
                 raw_tx = tx_data.raw_tx
@@ -1004,43 +1037,30 @@ class LiquidationPipelineV3:
                     f"nonce={nonce} fee_tier={tx_data.swap_route.fee_tier}"
                 )
             else:
-                cached = None   # rebuild failed, fall through to cold path
+                # Re-sign failed — release the nonce and rebuild from scratch
+                await self.nonce_mgr.rewind()
+                nonce = None
+                cached = None
 
         # ── COLD PATH — build from scratch ─────────────────────────────
         if cached is None:
-            # Try flash loan path first
+            # Build with nonce=0 placeholder — nonce is allocated AFTER a
+            # successful build so that a build failure never consumes a nonce
+            # slot that would create a gap for concurrent in-flight txs.
             tx_data = await self.flash_builder.build(
                 collateral_asset  = collateral_asset,
                 debt_asset        = best_debt_asset,
                 borrower          = borrower,
                 debt_to_cover     = debt_to_cover,
                 shared_state      = self.shared_state,
-                nonce             = nonce,
+                nonce             = 0,
                 asset_prices_usd  = asset_prices_usd or {},
                 asset_decimals    = DECIMALS,
             )
 
-            if tx_data is not None:
-                raw_tx = tx_data.raw_tx
-                logger.info(
-                    f"[Submit] Flash loan COLD path — {borrower[:10]}… "
-                    f"fee_tier={tx_data.swap_route.fee_tier} "
-                    f"slippage={tx_data.swap_route.slippage_pct:.2%} "
-                    f"est_profit={'$' + f'{tx_data.estimated_profit_usd:.2f}' if tx_data.estimated_profit_usd < 10_000 else 'IMPLAUSIBLE(bad_quote)'}"
-                )
-                # Cache for next time
-                from execution_guards import PresignedSnapshot
-                self._presigned_cache[borrower]     = tx_data
-                self._presigned_snapshots[borrower] = PresignedSnapshot(
-                    borrower         = borrower,
-                    base_fee_wei     = base_fee,
-                    debt_to_cover    = debt_to_cover,
-                    collateral_asset = collateral_asset,
-                    debt_asset       = best_debt_asset,
-                )
-            else:
-                # Flash loan unavailable — no fallback (direct path requires pre-funded wallet)
-                await self.nonce_mgr.rewind()
+            if tx_data is None:
+                # Flash loan unavailable — no fallback (direct path requires pre-funded wallet).
+                # No nonce was allocated so no rewind needed.
                 self.skip_tel.record(SkipEvent(
                     borrower = borrower,
                     reason   = SkipReason.BUILD_FAILED,
@@ -1048,10 +1068,36 @@ class LiquidationPipelineV3:
                 ))
                 return None
 
+            # Allocate nonce only now, then re-sign the already-built tx
+            nonce = await self.nonce_mgr.next()
+            tx_data = await self.flash_builder.rebuild_with_nonce(tx_data, nonce)
+            if tx_data is None:
+                await self.nonce_mgr.rewind()
+                return None
+
+            raw_tx = tx_data.raw_tx
+            logger.info(
+                f"[Submit] Flash loan COLD path — {borrower[:10]}… "
+                f"fee_tier={tx_data.swap_route.fee_tier} "
+                f"slippage={tx_data.swap_route.slippage_pct:.2%} "
+                f"est_profit={'$' + f'{tx_data.estimated_profit_usd:.2f}' if tx_data.estimated_profit_usd < 10_000 else 'IMPLAUSIBLE(bad_quote)'}"
+            )
+            # Cache for next time
+            from execution_guards import PresignedSnapshot
+            self._presigned_cache[borrower]     = tx_data
+            self._presigned_snapshots[borrower] = PresignedSnapshot(
+                borrower         = borrower,
+                base_fee_wei     = base_fee,
+                debt_to_cover    = debt_to_cover,
+                collateral_asset = collateral_asset,
+                debt_asset       = best_debt_asset,
+            )
+
         # ── Submit ─────────────────────────────────────────────────────
         tx_hash = await blast_submit(raw_tx)
 
         if tx_hash:
+            await self.nonce_mgr.mark_submitted(nonce)
             await self.tracker.add(borrower, tx_hash, nonce,
                                    collateral_asset=collateral_asset,
                                    debt_asset=debt_asset,
@@ -1108,6 +1154,25 @@ class LiquidationPipelineV3:
                 # Compound V3 check (every 10 blocks, gated internally)
                 if self.compound is not None:
                     await self.compound.on_new_block(current)
+
+                # DEX-DEX arbitrage scan (every block)
+                if self._arb_scanner is not None:
+                    try:
+                        opp = await self._arb_scanner.scan_once()
+                        if opp and opp.is_profitable():
+                            nonce = await self.nonce_mgr.next()
+                            tx_hash = await self._arb_executor.execute(
+                                opp,
+                                self._arb_multi_dex,
+                                nonce=nonce,
+                                dry_run=self._arb_dry_run,
+                            )
+                            if tx_hash:
+                                logger.info(f"[Arb] Submitted: {tx_hash}")
+                            elif not self._arb_dry_run:
+                                await self.nonce_mgr.rewind()
+                    except Exception as _arb_e:
+                        logger.warning(f"[Arb] scan/execute error: {_arb_e}")
 
                 # Three-tier position refresh — tuned for free-tier RPC rate limits
                 # (Arbitrum ~250ms/block: 30 blocks≈7.5s, 120 blocks≈30s, 400 blocks≈100s)
@@ -1263,6 +1328,13 @@ class LiquidationPipelineV3:
                 logger.info(self.skip_tel.summary())
                 if self.compound is not None:
                     logger.info(self.compound.status())
+                if self._arb_scanner is not None:
+                    self._arb_scanner.log_stats()
+                    arb_s = self._arb_executor.stats
+                    logger.info(
+                        f"[Arb] executed={arb_s['executed']} failed={arb_s['failed']} "
+                        f"dry_run={self._arb_dry_run}"
+                    )
                 for path, wr in win_rates.items():
                     logger.info(
                         f"[Stats] {path}: win_rate={wr['bayesian_win_rate']:.1%} "

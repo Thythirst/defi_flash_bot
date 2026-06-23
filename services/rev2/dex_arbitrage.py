@@ -29,12 +29,17 @@ Honest limitation:
 """
 
 import asyncio
+import json
 import logging
+import os
 import time
 from dataclasses import dataclass
-from typing import Optional
+from pathlib import Path
+from typing import Optional, List
 
-from web3 import AsyncWeb3
+import aiohttp
+from web3 import AsyncWeb3, Web3
+from web3.providers import AsyncHTTPProvider
 
 logger = logging.getLogger(__name__)
 
@@ -99,6 +104,9 @@ class ArbOpportunity:
     gas_cost_usd:    float
     net_profit_usd:  float
     spread_pct:      float
+    buy_amount_out:  int = 0  # pre-quoted buy output from spread check (skips re-quote)
+    buy_fee:         int = 0  # buy pool fee tier (UniV3) or 0 (Camelot)
+    sell_fee_tier:   int = 0  # sell pool fee tier (UniV3) or 0 (Camelot)
 
     def is_profitable(self) -> bool:
         return self.net_profit_usd >= MIN_PROFIT_USD
@@ -192,6 +200,9 @@ class ArbitrageScanner:
         if camelot_ab is None or univ3_ab is None:
             return None
 
+        camelot_ab_out, _camelot_ab_fee = camelot_ab
+        univ3_ab_out,   univ3_ab_fee    = univ3_ab
+
         # Direction 1: buy B on Camelot (more B out), sell B on Uni V3
         # Direction 2: buy B on Uni V3, sell B on Camelot
         # Pick whichever DEX gives more B for buying, sell on the other
@@ -199,23 +210,27 @@ class ArbitrageScanner:
         opportunities = []
 
         # Try: buy B where it's cheaper (more B per A), sell where it's pricier
-        if camelot_ab > univ3_ab:
+        if camelot_ab_out > univ3_ab_out:
             # Camelot gives more B — buy there, sell B back to A on Uni V3
-            b_amount = camelot_ab
-            a_back   = await self._quote_single_dex("univ3", token_b, token_a, b_amount)
-            if a_back:
-                opportunities.append(("camelot", "univ3", b_amount, a_back))
+            b_amount  = camelot_ab_out
+            buy_fee   = 0   # Camelot has no fee tier
+            sell_q    = await self._quote_single_dex("univ3", token_b, token_a, b_amount)
+            if sell_q:
+                a_back, sell_fee = sell_q
+                opportunities.append(("camelot", "univ3", b_amount, a_back, buy_fee, sell_fee))
         else:
             # Uni V3 gives more B — buy there, sell B back to A on Camelot
-            b_amount = univ3_ab
-            a_back   = await self._quote_single_dex("camelot", token_b, token_a, b_amount)
-            if a_back:
-                opportunities.append(("univ3", "camelot", b_amount, a_back))
+            b_amount  = univ3_ab_out
+            buy_fee   = univ3_ab_fee
+            sell_q    = await self._quote_single_dex("camelot", token_b, token_a, b_amount)
+            if sell_q:
+                a_back, sell_fee = sell_q
+                opportunities.append(("univ3", "camelot", b_amount, a_back, buy_fee, sell_fee))
 
         if not opportunities:
             return None
 
-        buy_dex, sell_dex, b_amount, a_back = opportunities[0]
+        buy_dex, sell_dex, b_amount, a_back, buy_fee, sell_fee = opportunities[0]
 
         # Gross profit in token_a units
         gross_profit = a_back - amount_a
@@ -250,12 +265,15 @@ class ArbitrageScanner:
             gas_cost_usd     = gas_cost_usd,
             net_profit_usd   = net_profit_usd,
             spread_pct       = spread_pct,
+            buy_amount_out   = b_amount,
+            buy_fee          = buy_fee,
+            sell_fee_tier    = sell_fee,
         )
 
     async def _quote_single_dex(
         self, dex: str, token_in: str, token_out: str, amount_in: int,
-    ) -> Optional[int]:
-        """Get a quote from one specific DEX. Returns amount_out or None."""
+    ) -> Optional[tuple]:
+        """Get a quote from one specific DEX. Returns (amount_out, fee_tier) or None."""
         try:
             if dex == "camelot":
                 result = await self._multi_dex._quote_camelot(
@@ -263,6 +281,9 @@ class ArbitrageScanner:
                     AsyncWeb3.to_checksum_address(token_out),
                     amount_in,
                 )
+                if result is None:
+                    return None
+                return (result.amount_out, 0)
             else:  # univ3 — try both fee tiers, take best
                 from multi_dex_router import UNIV3_FEE_TIERS
                 quotes = await asyncio.gather(*[
@@ -278,8 +299,7 @@ class ArbitrageScanner:
                 if not valid:
                     return None
                 result = max(valid, key=lambda q: q.amount_out)
-
-            return result.amount_out if result else None
+                return (result.amount_out, result.fee_tier)
         except Exception as e:
             logger.debug(f"[Arb] {dex} quote failed: {e}")
             return None
@@ -334,225 +354,365 @@ class ArbitrageScanner:
 
 
 # ---------------------------------------------------------------------------
-# ArbExecutor — builds and submits the flash-loan arb transaction
+# ArbExecutor — builds and submits arb txs to ArbExecutor.sol
 # ---------------------------------------------------------------------------
+
+_ARB_EXECUTOR_ABI = None
+
+async def _resolved(value):
+    return value
+
+
+def _load_arb_abi() -> list:
+    global _ARB_EXECUTOR_ABI
+    if _ARB_EXECUTOR_ABI is None:
+        artifact = (
+            Path(__file__).parent.parent.parent
+            / "out" / "ArbExecutor.sol" / "ArbExecutor.json"
+        )
+        _ARB_EXECUTOR_ABI = json.loads(artifact.read_text())["abi"]
+    return _ARB_EXECUTOR_ABI
+
 
 class ArbExecutor:
     """
-    Builds the flash-loan arbitrage transaction.
+    Encodes and submits ArbExecutor.sol's executeArbViaBalancer(ArbRoute).
 
     Flow (atomic, single tx):
-        1. Flash loan `amount_in` of token_in from Balancer (0% fee)
-        2. Swap token_in → token_out on buy_dex (cheap)
-        3. Swap token_out → token_in on sell_dex (expensive)
-        4. Repay flash loan (amount_in)
-        5. Keep the difference (profit)
+        1. Fresh on-chain quotes for both legs (captures current pool state)
+        2. Encode buy calldata (tokenIn → tokenOut, recipient = contract)
+        3. Pack ArbRoute struct: buyCalldata pre-encoded, sell built on-chain
+        4. Sign and broadcast EIP-1559 tx
 
-    NOTE: This requires an arbitrage executor contract that:
-        - Receives the Balancer flash loan
-        - Executes two swaps via approved routers
-        - Repays the loan
-        - Sends profit to owner
-
-    The existing FlashExecutorV3 does liquidation+swap. An arb executor
-    is similar but does swap+swap instead of liquidate+swap. This may
-    require a new contract method `executeArb()` or a separate contract.
-
-    See deployment notes below.
+    Deployed: 0x52184ca20E848A2e219b03eCFC7Dc04e839F50aF (Arbitrum, 2026-06-22)
+    Approved routers: Camelot 0x1F72..., UniV3 0xE592...
     """
+
+    ARB_GAS_LIMIT = 800_000
+    CHAIN_ID      = 42161
+
+    # Submit endpoints: Alchemy + direct Arbitrum sequencer + DRPC
+    _SUBMIT_URLS: List[str] = []
+
+    @classmethod
+    def _build_submit_urls(cls) -> List[str]:
+        urls = []
+        for var in ("ARBITRUM_HTTP_URL", "ALCHEMY_HTTP_URL"):
+            u = os.getenv(var, "")
+            if u and u not in urls:
+                urls.append(u)
+        # Arbitrum sequencer direct endpoint (FCFS, lowest latency)
+        urls.append("https://arb1-sequencer.arbitrum.io/rpc")
+        for var in ("DRPC_RPC_URL", "READ_RPC_PRIMARY"):
+            u = os.getenv(var, "")
+            if u and u not in urls:
+                urls.append(u)
+        return urls
 
     def __init__(
         self,
-        w3: AsyncWeb3,
+        w3:                   AsyncWeb3,
         arb_executor_address: str,
-        wallet: str,
-        private_key: str,
-        shared_state = None,
+        wallet:               str,
+        private_key:          str,
+        shared_state=None,
     ):
-        self._w3       = w3
-        self._executor = AsyncWeb3.to_checksum_address(arb_executor_address)
-        self._wallet   = AsyncWeb3.to_checksum_address(wallet)
-        self._pk       = private_key
-        self._state    = shared_state
+        from multi_dex_router import MultiDexRouter
 
-    async def build_arb_tx(
-        self,
-        opp:   ArbOpportunity,
-        nonce: int,
-        multi_dex,
-        slippage_bps: int = 30,
-    ) -> Optional[dict]:
-        """
-        Build the flash-loan arb transaction.
+        self._w3      = w3
+        self._addr    = AsyncWeb3.to_checksum_address(arb_executor_address)
+        self._wallet  = AsyncWeb3.to_checksum_address(wallet)
+        self._pk      = private_key
+        self._state   = shared_state
 
-        The arb executor contract receives:
-            - flashToken, flashAmount (Balancer flash loan params)
-            - buyRouter, buyCalldata (first swap)
-            - sellRouter, sellCalldata (second swap)
-            - minProfit (revert if not met)
-        """
-        from web3 import Web3
+        # Sync Web3 contract for ABI encoding (AsyncContract lacks encode_abi)
+        _sync_w3 = Web3()
+        self._contract = _sync_w3.eth.contract(address=self._addr, abi=_load_arb_abi())
 
-        # Build buy swap calldata (token_in → token_out on buy_dex)
-        buy_quote = await self._build_swap_quote(
-            multi_dex, opp.buy_dex,
-            opp.token_in, opp.token_out, opp.amount_in, slippage_bps,
-        )
-        if buy_quote is None:
-            return None
-        buy_calldata, expected_out = buy_quote
+        # MultiDexRouter with arb executor as recipient — used only for
+        # encoding buy calldata so tokens land in the contract, not the wallet
+        self._enc_router = MultiDexRouter(w3, arb_executor_address)
 
-        # Build sell swap calldata (token_out → token_in on sell_dex)
-        sell_quote = await self._build_swap_quote(
-            multi_dex, opp.sell_dex,
-            opp.token_out, opp.token_in, expected_out, slippage_bps,
-        )
-        if sell_quote is None:
-            return None
-        sell_calldata, _ = sell_quote
+        self._executed = 0
+        self._failed   = 0
 
-        # Minimum profit — revert if arb doesn't clear this
-        min_profit = int(opp.amount_in * (1 + opp.spread_pct / 100 * 0.5))
+        # Raw aiohttp sessions for submission — pre-warmed by warmup()
+        self._submit_sessions: Optional[List[aiohttp.ClientSession]] = None
 
-        # Gas
-        base_fee = self._state.base_fee_wei if self._state else 100_000_000
-        max_fee  = int(base_fee * 5.0) + int(base_fee * 0.5)
-        priority = int(base_fee * 0.5)
+        # Nonce cache — avoid one RPC round-trip per execution
+        self._nonce: Optional[int] = None
 
-        # NOTE: This assumes an executeArb method on the arb executor.
-        # Encode the call — adjust signature to match deployed contract.
-        try:
-            sync_w3 = Web3()
-            # Placeholder ABI encoding — replace with actual contract method
-            logger.info(
-                f"[ArbExec] Built arb: {opp.token_in[:8]}→{opp.token_out[:8]} "
-                f"buy={opp.buy_dex} sell={opp.sell_dex} "
-                f"min_profit={min_profit} net=${opp.net_profit_usd:.2f}"
+    # ── Public API ──────────────────────────────────────────────────────────
+
+    async def warmup(self) -> None:
+        """Pre-warm TCP+TLS connections and fetch initial nonce. Call at startup."""
+        await self._init_submit_sessions()
+        self._nonce = await self._w3.eth.get_transaction_count(self._wallet, "pending")
+        logger.info(f"[ArbExec] Warmed up — nonce={self._nonce}")
+        asyncio.create_task(self._keepalive_loop())
+
+    async def _keepalive_loop(self) -> None:
+        """Ping submit endpoints every 20s to keep TCP connections alive."""
+        urls = self._build_submit_urls()
+        while True:
+            await asyncio.sleep(20)
+            if not self._submit_sessions:
+                continue
+            # Use sendRawTransaction with empty payload — only method sequencer supports
+            body = {"id": 1, "jsonrpc": "2.0", "method": "eth_sendRawTransaction",
+                    "params": ["0x"]}
+            async def _ping(session: aiohttp.ClientSession, url: str) -> None:
+                try:
+                    async with session.post(url, json=body,
+                                            timeout=aiohttp.ClientTimeout(total=3)) as r:
+                        await r.read()
+                except Exception:
+                    pass
+            await asyncio.gather(
+                *[_ping(s, urls[i]) for i, s in enumerate(self._submit_sessions)],
+                return_exceptions=True,
             )
-            return {
-                "opportunity":   opp,
-                "buy_calldata":  buy_calldata,
-                "sell_calldata": sell_calldata,
-                "min_profit":    min_profit,
-                "max_fee":       max_fee,
-                "priority":      priority,
-                "nonce":         nonce,
-            }
+
+    async def execute(
+        self,
+        opp:         ArbOpportunity,
+        multi_dex,
+        nonce:       Optional[int] = None,
+        slippage_bps: int = 30,
+        dry_run:     bool = False,
+    ) -> Optional[str]:
+        """
+        Build, sign, and broadcast the arb transaction. Returns tx hash or None.
+        """
+        tx = await self._build_tx(opp, multi_dex, nonce, slippage_bps)
+        if tx is None:
+            return None
+
+        if dry_run:
+            logger.info(
+                f"[ArbExec] DRY RUN: would send {opp.token_in[:10]}→"
+                f"{opp.token_out[:10]} net=${opp.net_profit_usd:.2f}"
+            )
+            return None
+
+        try:
+            account = Web3().eth.account.from_key(self._pk)
+            signed  = account.sign_transaction(tx)
+            raw     = signed.raw_transaction
+
+            tx_hash = await self._broadcast(raw)
+            if tx_hash:
+                self._executed += 1
+                logger.info(f"[ArbExec] Broadcast: {tx_hash}")
+                return tx_hash
+            self._failed += 1
+            return None
         except Exception as e:
-            logger.error(f"[ArbExec] Build failed: {e}")
+            self._failed += 1
+            logger.error(f"[ArbExec] Broadcast failed: {e}")
             return None
 
-    async def _build_swap_quote(
-        self, multi_dex, dex, token_in, token_out, amount_in, slippage_bps,
-    ):
-        """Build swap calldata for a specific DEX."""
-        from multi_dex_router import DexQuote, CAMELOT_ROUTER, UNIV3_ROUTER
+    async def _broadcast(self, raw: bytes) -> Optional[str]:
+        """Fire signed tx to all submit endpoints simultaneously; return first hash."""
+        if self._submit_sessions is None:
+            await self._init_submit_sessions()
 
-        if dex == "camelot":
-            q = await multi_dex._quote_camelot(token_in, token_out, amount_in)
-        else:
-            from multi_dex_router import UNIV3_FEE_TIERS
-            quotes = await asyncio.gather(*[
-                multi_dex._quote_univ3(token_in, token_out, amount_in, fee)
-                for fee in UNIV3_FEE_TIERS
-            ], return_exceptions=True)
-            valid = [x for x in quotes if x and not isinstance(x, Exception)]
-            q = max(valid, key=lambda x: x.amount_out) if valid else None
+        raw_hex  = "0x" + raw.hex()
+        body     = {"id": 1, "jsonrpc": "2.0", "method": "eth_sendRawTransaction",
+                    "params": [raw_hex]}
+        nonce_collision = False
 
-        if q is None or q.amount_out == 0:
+        t_tasks_created = time.time()
+
+        async def _post(session: aiohttp.ClientSession, url: str) -> Optional[str]:
+            nonlocal nonce_collision
+            try:
+                t_start = time.time()
+                lag_ms = int((t_start - t_tasks_created) * 1000)
+                t0 = time.time()
+                async with session.post(url, json=body, timeout=aiohttp.ClientTimeout(total=2)) as resp:
+                    data = await resp.json(content_type=None)
+                logger.info(f"[ArbExec] {url[8:30]} lag={lag_ms}ms rtt={int((time.time()-t0)*1000)}ms")
+                if "error" in data:
+                    err = data["error"].get("message", "")
+                    if "already known" in err.lower() or "replacement" in err.lower():
+                        logger.debug(f"[ArbExec] {url[:30]}: already known")
+                    elif "nonce too low" in err.lower():
+                        nonce_collision = True
+                        logger.warning(f"[ArbExec] nonce too low — resetting cache")
+                    else:
+                        logger.warning(f"[ArbExec] {url[:30]} rpc error: {err[:80]}")
+                    return None
+                h = data.get("result", "")
+                if h:
+                    logger.info(f"[ArbExec] Confirmed via {url[:40]}: {h}")
+                    return h
+                return None
+            except Exception as e:
+                logger.warning(f"[ArbExec] {url[:30]} failed: {str(e)[:60]}")
+                return None
+
+        urls  = self._build_submit_urls()
+        tasks = [asyncio.create_task(_post(self._submit_sessions[i], urls[i]))
+                 for i in range(len(urls))]
+
+        result: Optional[str] = None
+        remaining = list(tasks)
+        try:
+            deadline = asyncio.get_event_loop().time() + 2.0
+            while remaining and not result:
+                wait_secs = deadline - asyncio.get_event_loop().time()
+                if wait_secs <= 0:
+                    break
+                done, _ = await asyncio.wait(
+                    remaining, timeout=wait_secs,
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
+                if not done:
+                    break
+                for t in done:
+                    remaining.remove(t)
+                    if not t.cancelled() and t.exception() is None and t.result():
+                        result = t.result()
+                        break
+        finally:
+            for t in remaining:
+                t.cancel()
+
+        if result:
+            if self._nonce is not None:
+                self._nonce += 1
+        elif nonce_collision:
+            self._nonce = None
+
+        return result
+
+    async def _init_submit_sessions(self) -> None:
+        urls  = self._build_submit_urls()
+        sessions: List[aiohttp.ClientSession] = []
+        for url in urls:
+            connector = aiohttp.TCPConnector(limit=4, keepalive_timeout=300,
+                                             force_close=False, enable_cleanup_closed=True)
+            session   = aiohttp.ClientSession(connector=connector)
+            # Warm TCP+TLS with a sendRawTransaction call using empty payload
+            # (will fail with -32000 but the TCP handshake completes)
+            try:
+                async with session.post(url,
+                                        json={"id":1,"jsonrpc":"2.0","method":"eth_sendRawTransaction","params":["0x"]},
+                                        timeout=aiohttp.ClientTimeout(total=5)) as r:
+                    await r.read()
+            except Exception:
+                pass
+            sessions.append(session)
+        self._submit_sessions = sessions
+        logger.info(f"[ArbExec] Submit sessions ready: {urls}")
+
+    # ── Internal ────────────────────────────────────────────────────────────
+
+    async def _build_tx(
+        self,
+        opp:          ArbOpportunity,
+        multi_dex,
+        nonce:        Optional[int],
+        slippage_bps: int,
+    ) -> Optional[dict]:
+        from multi_dex_router import UNIV3_FEE_TIERS
+
+        from multi_dex_router import DexQuote
+
+        token_in  = AsyncWeb3.to_checksum_address(opp.token_in)
+        token_out = AsyncWeb3.to_checksum_address(opp.token_out)
+
+        # ── Nonce — use cache to avoid one RPC round-trip ────────────────
+        if nonce is None:
+            if self._nonce is not None:
+                nonce = self._nonce
+            else:
+                nonce = await self._w3.eth.get_transaction_count(self._wallet, "pending")
+                self._nonce = nonce
+
+        # ── Buy calldata from pre-quoted amount (no re-quote) ─────────────
+        buy_amount_out = opp.buy_amount_out
+        if not buy_amount_out:
+            logger.info("[ArbExec] no pre-quoted buy amount, skipping")
+            return None
+        buy_out_min  = int(buy_amount_out * (10_000 - slippage_bps) / 10_000)
+        buy_q = DexQuote(
+            dex=opp.buy_dex, router=opp.buy_router,
+            amount_out=buy_amount_out, fee_tier=opp.buy_fee,
+            token_in=token_in, token_out=token_out, amount_in=opp.amount_in,
+        )
+        buy_calldata = self._enc_router.encode_calldata(buy_q, buy_out_min)
+
+        # ── Sell parameters from opportunity (no re-quote) ────────────────
+        sell_is_camelot = opp.sell_dex == "camelot"
+        sell_fee        = 0 if sell_is_camelot else opp.sell_fee_tier
+
+        # min_profit: 0.05% of principal in tokenIn units (on-chain guard enforces)
+        min_profit   = max(1, opp.amount_in // 2000)
+        sell_min_out = opp.amount_in + min_profit
+
+        route = (
+            token_in,           # tokenIn
+            opp.amount_in,      # amountIn
+            AsyncWeb3.to_checksum_address(opp.buy_router),   # buyRouter
+            buy_calldata,       # buyCalldata (bytes, pre-encoded)
+            AsyncWeb3.to_checksum_address(opp.sell_router),  # sellRouter
+            token_out,          # tokenOut
+            sell_is_camelot,    # sellIsCamelot
+            sell_fee,           # sellFee (UniV3 fee tier or 0)
+            sell_min_out,       # sellMinOut
+            min_profit,         # minProfit
+        )
+
+        tx_data = self._contract.encode_abi(
+            "executeArbViaBalancer", args=[route]
+        )
+
+        base_fee = (
+            self._state.base_fee_wei
+            if self._state and self._state.base_fee_wei > 0
+            else 100_000_000
+        )
+        max_fee  = base_fee * 4
+        priority = min(int(0.1e9), base_fee)
+
+        logger.info(
+            f"[ArbExec] Built: {opp.token_in[:10]} buy={opp.buy_dex} "
+            f"sell={opp.sell_dex} buy_out={buy_amount_out} "
+            f"min_profit={min_profit} net~${opp.net_profit_usd:.2f}"
+        )
+
+        return {
+            "to":                 self._addr,
+            "data":               tx_data,
+            "nonce":              nonce,
+            "gas":                self.ARB_GAS_LIMIT,
+            "maxFeePerGas":       max_fee,
+            "maxPriorityFeePerGas": priority,
+            "chainId":            self.CHAIN_ID,
+            "value":              0,
+            "type":               2,
+        }
+
+    async def _quote_dex(self, multi_dex, dex: str, token_in, token_out, amount_in):
+        """Fresh single-dex quote; for UniV3 returns the best fee tier."""
+        from multi_dex_router import UNIV3_FEE_TIERS
+        try:
+            if dex == "camelot":
+                return await multi_dex._quote_camelot(token_in, token_out, amount_in)
+            else:
+                quotes = await asyncio.gather(*[
+                    multi_dex._quote_univ3(token_in, token_out, amount_in, fee)
+                    for fee in UNIV3_FEE_TIERS
+                ], return_exceptions=True)
+                valid = [q for q in quotes if q and not isinstance(q, Exception)]
+                return max(valid, key=lambda q: q.amount_out) if valid else None
+        except Exception as e:
+            logger.debug(f"[ArbExec] quote({dex}) failed: {e}")
             return None
 
-        amount_out_min = int(q.amount_out * (10_000 - slippage_bps) / 10_000)
-        calldata = multi_dex.encode_calldata(q, amount_out_min)
-        return calldata, q.amount_out
-
-
-# ---------------------------------------------------------------------------
-# Arb executor contract — deployment notes
-# ---------------------------------------------------------------------------
-#
-# The existing FlashExecutorV3 does liquidate+swap. Arbitrage needs swap+swap
-# inside a flash loan. You need an ArbExecutor contract:
-#
-#   contract ArbExecutor {
-#       function executeArb(
-#           address flashToken,
-#           uint256 flashAmount,
-#           address buyRouter,
-#           bytes   calldata buyCalldata,
-#           address sellRouter,
-#           bytes   calldata sellCalldata,
-#           uint256 minProfit
-#       ) external onlyOwner {
-#           // 1. Request Balancer flash loan
-#           // 2. In receiveFlashLoan callback:
-#           //    a. approve buyRouter, buyRouter.call(buyCalldata)
-#           //    b. approve sellRouter, sellRouter.call(sellCalldata)
-#           //    c. require(balance >= flashAmount + minProfit)
-#           //    d. repay flashAmount to Balancer
-#           //    e. transfer profit to owner
-#       }
-#   }
-#
-# This is structurally similar to your existing executor — same flash loan
-# pattern, same generic router.call() swaps, just two swaps instead of
-# liquidate+swap. Whitelist the same routers (Camelot, Uni V3) already approved.
-#
-# ---------------------------------------------------------------------------
-#
-# pipeline integration:
-#
-# 1. Import:
-#       from dex_arbitrage import ArbitrageScanner, ArbExecutor
-#
-# 2. In setup():
-#       self.arb_scanner = ArbitrageScanner(
-#           multi_dex    = self.flash_builder._swap_builder._multi_dex,
-#           shared_state = self.shared_state,
-#           price_reg    = self.prices,
-#           min_profit_usd = 5.0,
-#       )
-#       self.arb_executor = ArbExecutor(
-#           w3 = self.rpc.w3,
-#           arb_executor_address = os.getenv("ARB_EXECUTOR_ADDR"),
-#           wallet = WALLET_ADDR,
-#           private_key = PRIVATE_KEY,
-#           shared_state = self.shared_state,
-#       )
-#
-# 3. In block handler (on_new_block), after liquidation checks:
-#       opp = await self.arb_scanner.scan_once()
-#       if opp and opp.is_profitable():
-#           nonce = await self.nonce_mgr.next()
-#           arb_tx = await self.arb_executor.build_arb_tx(
-#               opp, nonce, self.arb_scanner._multi_dex
-#           )
-#           if arb_tx:
-#               # submit via blast_submit
-#               ...
-#
-# 4. In stats loop:
-#       self.arb_scanner.log_stats()
-#
-# ---------------------------------------------------------------------------
-#
-# IMPORTANT — realistic expectations:
-#
-# Two-point arb between Camelot and Uni V3 on major pairs (WETH/USDC) is
-# HIGHLY competitive. Spreads are usually arbed away within one block by
-# bots with co-located infrastructure. You will mostly see:
-#   - Tiny spreads (< gas cost) — not profitable
-#   - Occasional real spreads after large trades — race to capture
-#
-# The profitable opportunities are:
-#   - Less liquid pairs (ARB/USDC, WBTC/WETH) where fewer bots compete
-#   - Moments right after a large swap unbalances a pool
-#   - Times of high volatility when prices move fast
-#
-# This is why co-location matters MORE for arb than liquidations.
-# Liquidations have a ~12s window (oracle heartbeat). Arb spreads close
-# in 1-2 blocks. Without co-location, you'll lose most arb races.
-#
-# Recommendation: deploy this AFTER migrating to AWS/co-location.
-# Running it from Kenya (~200ms latency) will lose nearly every arb race.
+    @property
+    def stats(self) -> dict:
+        return {"executed": self._executed, "failed": self._failed}
 # ---------------------------------------------------------------------------

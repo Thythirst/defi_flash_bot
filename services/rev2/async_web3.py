@@ -28,6 +28,7 @@ import os
 import time
 from typing import Optional, Any
 
+import aiohttp
 from web3 import AsyncWeb3
 from web3.providers import AsyncHTTPProvider
 from web3.middleware import ExtraDataToPOAMiddleware
@@ -94,11 +95,13 @@ class AsyncRPCClient:
         self._consecutive_timeouts = 0
 
     async def connect(self) -> None:
-        from aiohttp import ClientTimeout
-        provider = AsyncHTTPProvider(
-            self.http_url,
-            request_kwargs={"timeout": ClientTimeout(total=self.request_timeout)},
+        connector = aiohttp.TCPConnector(limit=10, keepalive_timeout=30, enable_cleanup_closed=True)
+        session   = aiohttp.ClientSession(
+            connector=connector,
+            timeout=aiohttp.ClientTimeout(total=self.request_timeout),
         )
+        provider  = AsyncHTTPProvider(self.http_url)
+        await provider.cache_async_session(session)
         self._w3 = AsyncWeb3(provider)
         # Required for Arbitrum (PoA-compatible chain)
         self._w3.middleware_onion.inject(ExtraDataToPOAMiddleware, layer=0)
@@ -231,6 +234,7 @@ class NonceManager:
         self._nonce: Optional[int] = None
         self._lock   = asyncio.Lock()
         self._pending_count = 0  # tracks how many unconfirmed txs we've sent
+        self._submitted_floor: int = -1  # highest nonce passed to blast_submit (may be in private mempool)
 
     async def init(self) -> None:
         """Fetch current on-chain nonce. Call once at startup."""
@@ -259,19 +263,38 @@ class NonceManager:
         async with self._lock:
             self._pending_count = max(0, self._pending_count - 1)
 
+    async def mark_submitted(self, nonce: int) -> None:
+        """
+        Call immediately after blast_submit returns a tx_hash.
+        Records the highest nonce that reached a submission endpoint (possibly
+        a private/MEV mempool not visible to read RPCs) so that rewind() never
+        resets below it and causes a nonce collision with the in-flight tx.
+        """
+        async with self._lock:
+            if nonce > self._submitted_floor:
+                self._submitted_floor = nonce
+                logger.debug(f"[NonceManager] Submitted floor → {self._submitted_floor}")
+
     async def rewind(self) -> None:
         """
         Call if a tx fails to submit (not just reverts — reverts consume nonce).
-        Decrements the local counter and re-syncs from chain.
+        Re-syncs from chain but never resets below submitted_floor+1 so that
+        concurrent coroutines whose txs landed in a private/MEV mempool are not
+        overwritten by a sibling build/submit failure resetting the nonce pointer.
         """
         async with self._lock:
-            # Re-sync from chain — the safe recovery path
             on_chain = await self._w3.eth.get_transaction_count(
                 self._wallet, "pending"
             )
-            self._nonce = on_chain
-            self._pending_count = 0
-            logger.warning(f"[NonceManager] Rewound — re-synced to nonce {self._nonce}")
+            # Don't go below the highest nonce we KNOW was sent to an endpoint.
+            # Read RPCs can't see private-mempool txs, so on_chain may lag behind.
+            floor = max(on_chain, self._submitted_floor + 1)
+            if self._nonce > floor:
+                self._nonce = floor
+            logger.warning(
+                f"[NonceManager] Rewound — chain={on_chain} "
+                f"submitted_floor={self._submitted_floor} → nonce={self._nonce}"
+            )
 
     async def sync(self) -> None:
         """Periodic re-sync (call every 60s) to catch any out-of-band txs."""
@@ -279,12 +302,13 @@ class NonceManager:
             on_chain = await self._w3.eth.get_transaction_count(
                 self._wallet, "pending"
             )
-            if on_chain != self._nonce:
+            floor = max(on_chain, self._submitted_floor + 1)
+            if self._nonce != floor:
                 logger.warning(
                     f"[NonceManager] Drift detected — "
-                    f"local={self._nonce}, chain={on_chain}. Re-syncing."
+                    f"local={self._nonce}, chain={on_chain}, floor={floor}. Re-syncing."
                 )
-                self._nonce = on_chain
+                self._nonce = floor
 
 
 # ---------------------------------------------------------------------------

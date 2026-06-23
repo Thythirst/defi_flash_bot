@@ -220,6 +220,13 @@ class QuoteCache:
 
         scaled_out, fee_tier = entry.scale_to(amount_in)
 
+        # Reject zero-output: scale_to() truncates to 0 for very small amount_in
+        # (tiny dust positions). A zero amount_out causes 100% slippage in the
+        # validator and always fails. Fall through to live QuoterV2 instead.
+        if scaled_out == 0:
+            self._misses += 1
+            return None
+
         # Sanity check: reject cached quotes where output vastly exceeds input.
         # Normalize by token decimals — cross-decimal pairs (USDC→WETH) have
         # different raw ratios due to 6 vs 18 decimal difference.
