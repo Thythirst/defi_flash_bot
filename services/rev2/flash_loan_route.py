@@ -129,6 +129,28 @@ EXECUTOR_ABI = [
         "type": "function",
     },
     {
+        "inputs": [
+            {"internalType": "address", "name": "debtAsset", "type": "address"},
+            {
+                "name": "items",
+                "type": "tuple[]",
+                "internalType": "struct BatchItem[]",
+                "components": [
+                    {"name": "collateralAsset", "type": "address", "internalType": "address"},
+                    {"name": "borrower",        "type": "address", "internalType": "address"},
+                    {"name": "debtToCover",     "type": "uint256", "internalType": "uint256"},
+                    {"name": "receiveAToken",   "type": "bool",    "internalType": "bool"},
+                    {"name": "swapRouter",      "type": "address", "internalType": "address"},
+                    {"name": "swapCalldata",    "type": "bytes",   "internalType": "bytes"},
+                ],
+            },
+        ],
+        "name": "executeLiquidationBatch",
+        "outputs": [],
+        "stateMutability": "nonpayable",
+        "type": "function",
+    },
+    {
         "inputs": [],
         "name": "BALANCER_VAULT",
         "outputs": [{"internalType": "address", "name": "", "type": "address"}],
@@ -617,6 +639,7 @@ class FlashLoanTxBuilder:
 
     GAS_LIMIT_FLASH  = 700_000   # flash loan path — more complex than direct
     GAS_LIMIT_DIRECT = 400_000   # direct path fallback
+    GAS_LIMIT_BATCH  = 2_500_000 # batch: ~325k/item measured + flash overhead + headroom
     GAS_PREMIUM      = 2.0       # maxFeePerGas = base_fee * GAS_PREMIUM (EIP-1559)
 
     def __init__(
@@ -1005,6 +1028,120 @@ class FlashLoanTxBuilder:
         except Exception as e:
             logger.error(f"[FlashBuilder] rebuild_with_nonce failed: {e}")
             return None
+
+    async def build_batch(
+        self,
+        debt_asset: str,
+        items: list,       # list of dicts: {borrower, collateral_asset, debt_to_cover, collateral_amount, asset_prices_usd, asset_decimals}
+        shared_state,
+        nonce: int,
+    ) -> Optional[tuple]:  # (raw_tx: bytes, total_debt: int, profit_usd: float, n_built: int)
+        """
+        Build a signed executeLiquidationBatch() tx covering multiple borrowers
+        in one flash loan. All items share debt_asset.
+
+        Per-item swap routes are built independently; items that fail to get a
+        route are skipped (logged) so a bad pair cannot kill the whole batch.
+        Returns None if fewer than 2 items survive route-building.
+        """
+        debt_asset = AsyncWeb3.to_checksum_address(debt_asset)
+
+        batch_tuples = []
+        total_debt   = 0
+        profit_usd   = 0.0
+
+        for item in items:
+            borrower         = AsyncWeb3.to_checksum_address(item['borrower'])
+            collateral_asset = AsyncWeb3.to_checksum_address(item['collateral_asset'])
+            debt_to_cover    = item['debt_to_cover']
+            collateral_amt   = item.get('collateral_amount', 0)
+            prices           = item.get('asset_prices_usd', {})
+            decimals         = item.get('asset_decimals', {})
+
+            if collateral_asset.lower() == debt_asset.lower():
+                swap_router   = "0x0000000000000000000000000000000000000000"
+                swap_calldata = b""
+                item_profit   = 0.0
+            else:
+                amount_in  = collateral_amt if collateral_amt > 0 else int(debt_to_cover * 1.05)
+                swap_route = await self._swap_builder.build(
+                    token_in    = collateral_asset,
+                    token_out   = debt_asset,
+                    amount_in   = amount_in,
+                    slippage_bps= self._slippage,
+                )
+                if swap_route is None:
+                    logger.warning(
+                        f"[BatchBuilder] No swap route {collateral_asset[:10]}→{debt_asset[:10]} "
+                        f"borrower={borrower[:10]}… — skipping item"
+                    )
+                    continue
+                swap_router   = swap_route.router
+                swap_calldata = swap_route.calldata
+                # Rough per-item profit: collateral USD out minus debt USD in
+                col_key   = collateral_asset.lower()
+                dbt_key   = debt_asset.lower()
+                col_price = next((p for k, p in prices.items() if k.lower() == col_key), 0)
+                dbt_price = next((p for k, p in prices.items() if k.lower() == dbt_key), 0)
+                col_dec   = decimals.get(collateral_asset, decimals.get(col_key, 18))
+                dbt_dec   = decimals.get(debt_asset,       decimals.get(dbt_key, 18))
+                if col_price > 0 and dbt_price > 0:
+                    col_usd = (amount_in / 10**col_dec) * (col_price / 1e8)
+                    dbt_usd = (debt_to_cover / 10**dbt_dec) * (dbt_price / 1e8)
+                    item_profit = max(0.0, col_usd - dbt_usd)
+                else:
+                    item_profit = 0.0
+
+            batch_tuples.append((
+                collateral_asset,
+                borrower,
+                debt_to_cover,
+                False,          # receiveAToken — False so swap self-funds flash repay
+                AsyncWeb3.to_checksum_address(swap_router),
+                swap_calldata,
+            ))
+            total_debt += debt_to_cover
+            profit_usd += item_profit
+
+        if len(batch_tuples) < 2:
+            logger.warning(
+                f"[BatchBuilder] Only {len(batch_tuples)} item(s) survived route-building "
+                f"for debt={debt_asset[:10]}… — falling back to single path"
+            )
+            return None
+
+        if self._gas_oracle:
+            rec          = self._gas_oracle.recommend()
+            max_fee      = rec.max_fee_per_gas
+            priority_fee = rec.max_priority_fee_per_gas
+        else:
+            base_fee     = shared_state.base_fee_wei or 100_000_000
+            max_fee      = int(base_fee * self.GAS_PREMIUM * 2)
+            priority_fee = max(int(base_fee * 0.5), 1_000_000)
+
+        try:
+            tx_dict = await self._executor.functions.executeLiquidationBatch(
+                debt_asset,
+                batch_tuples,
+            ).build_transaction({
+                "from":                 self._wallet,
+                "nonce":                nonce,
+                "gas":                  self.GAS_LIMIT_BATCH,
+                "maxFeePerGas":         max_fee,
+                "maxPriorityFeePerGas": priority_fee,
+                "chainId":              42161,
+            })
+            signed = self._sync_w3.eth.account.sign_transaction(tx_dict, self._pk)
+        except Exception as e:
+            logger.error(f"[BatchBuilder] TX build failed: {e}")
+            return None
+
+        logger.info(
+            f"[BatchBuilder] Built batch N={len(batch_tuples)} "
+            f"debt={debt_asset[:10]}… totalDebt={total_debt} "
+            f"est_profit=${profit_usd:.2f}"
+        )
+        return (signed.raw_transaction, total_debt, profit_usd, len(batch_tuples))
 
 
 # ---------------------------------------------------------------------------

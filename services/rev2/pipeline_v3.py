@@ -239,6 +239,8 @@ class LiquidationPipelineV3:
         self._in_flight: set = set()
         self._shutdown = asyncio.Event()
         self.wallet_balances: Dict[str, int] = {}
+        self._batch_queue: list = []          # pending liquidations to batch per block
+        self._batch_timer: Optional[asyncio.Task] = None  # fires after 50ms window
 
     async def setup(self):
         """Initialize all subsystems. Called once at startup."""
@@ -847,11 +849,188 @@ class LiquidationPipelineV3:
                 self.hf_detector.on_hf_update(address, old_hf, hf)
             )
 
-        asyncio.create_task(self._execute_liquidation(address, hf, pos))
+        # Queue for batch collection — flush fires after 50ms window so same-block
+        # positions sharing a debt asset get batched into one tx / one nonce.
+        self._in_flight.add(address)
+        self._batch_queue.append({'address': address, 'hf': hf, 'pos': pos})
+        if self._batch_timer is None or self._batch_timer.done():
+            self._batch_timer = asyncio.create_task(self._flush_batch())
+
+    async def _flush_batch(self):
+        """
+        50ms collection window: drain _batch_queue, group by debt asset,
+        submit batches (N>1) or fall through to the single-position path (N=1).
+        """
+        await asyncio.sleep(0.05)
+
+        items, self._batch_queue = self._batch_queue, []
+
+        if not items:
+            return
+
+        # Resolve debt asset + build per-item metadata for each queued position
+        resolved: list[dict] = []
+        prices_snap = self.prices.snapshot() if hasattr(self.prices, 'snapshot') else {}
+
+        for entry in items:
+            address = entry['address']
+            hf      = entry['hf']
+            pos     = entry['pos']
+            try:
+                account_data = self.loader.get(address)
+                if account_data is None:
+                    self._in_flight.discard(address)
+                    continue
+
+                best_debt = self._select_best_debt_asset(account_data)
+                if best_debt is None:
+                    self._in_flight.discard(address)
+                    continue
+
+                asset_prices_usd = {k: v / 1e8 for k, v in prices_snap.items()}
+                selection = self.selector.select(
+                    account_data=account_data,
+                    total_debt_usd=account_data.total_debt_base / 1e8,
+                    asset_prices_usd=asset_prices_usd,
+                    asset_decimals=DECIMALS,
+                )
+                if selection is None:
+                    self._in_flight.discard(address)
+                    continue
+
+                debt_price_raw = prices_snap.get(best_debt, 0)
+                debt_dec       = DECIMALS.get(best_debt, 18)
+                if debt_price_raw > 0:
+                    dtc_usd       = account_data.total_debt_base / 1e8 * selection.close_factor
+                    debt_to_cover = int(dtc_usd / (debt_price_raw / 1e8) * (10 ** debt_dec))
+                else:
+                    debt_to_cover = selection.debt_to_cover
+
+                bonus_mult        = selection.liquidation_bonus_bps / 10_000
+                collateral_amount = int(debt_to_cover * bonus_mult)
+
+                resolved.append({
+                    'address':          address,
+                    'hf':               hf,
+                    'pos':              pos,
+                    'debt_asset':       best_debt,
+                    'collateral_asset': selection.asset,
+                    'debt_to_cover':    debt_to_cover,
+                    'collateral_amount':collateral_amount,
+                    'asset_prices_usd': prices_snap,  # raw (×1e8) — build_batch normalises
+                    'asset_decimals':   DECIMALS,
+                    'profit_usd':       selection.expected_profit_usd,
+                    'account_data':     account_data,
+                    'selection':        selection,
+                })
+            except Exception as e:
+                logger.warning(f"[Batch] resolve failed {address[:10]}: {e}")
+                self._in_flight.discard(address)
+
+        if not resolved:
+            return
+
+        # Group by debt asset
+        by_debt: dict[str, list] = {}
+        for r in resolved:
+            by_debt.setdefault(r['debt_asset'], []).append(r)
+
+        for debt_asset, group in by_debt.items():
+            if len(group) >= 2:
+                # Profit gate on group aggregate
+                total_profit = sum(r['profit_usd'] for r in group)
+                ok, reason = await self.fast_gas_guard.check()
+                if not ok:
+                    logger.info(f"[Batch] Gas guard: {reason} — releasing {len(group)} items")
+                    for r in group:
+                        self._in_flight.discard(r['address'])
+                    continue
+                asyncio.create_task(
+                    self._execute_batch(debt_asset, group, total_profit)
+                )
+            else:
+                # Single — release _in_flight and use existing path
+                r = group[0]
+                self._in_flight.discard(r['address'])
+                asyncio.create_task(
+                    self._execute_liquidation(r['address'], r['hf'], r['pos'])
+                )
+
+    async def _execute_batch(self, debt_asset: str, group: list, total_profit_usd: float):
+        """Submit one executeLiquidationBatch tx for a group sharing debt_asset."""
+        addresses = [r['address'] for r in group]
+        t0 = time.monotonic()
+
+        try:
+            if not self.profit_gate.check(total_profit_usd):
+                logger.info(
+                    f"[Batch] Aggregate profit ${total_profit_usd:.2f} below floor "
+                    f"${self.profit_gate.min_profit_usd:.2f} — skipping N={len(group)}"
+                )
+                return
+
+            build_items = [{
+                'borrower':          r['address'],
+                'collateral_asset':  r['collateral_asset'],
+                'debt_to_cover':     r['debt_to_cover'],
+                'collateral_amount': r['collateral_amount'],
+                'asset_prices_usd':  r['asset_prices_usd'],
+                'asset_decimals':    r['asset_decimals'],
+            } for r in group]
+
+            nonce = await self.nonce_mgr.next()
+            result = await self.flash_builder.build_batch(
+                debt_asset   = debt_asset,
+                items        = build_items,
+                shared_state = self.shared_state,
+                nonce        = nonce,
+            )
+
+            if result is None:
+                # Route-building left < 2 items — fall back each to single path
+                await self.nonce_mgr.rewind()
+                for r in group:
+                    self._in_flight.discard(r['address'])
+                    asyncio.create_task(
+                        self._execute_liquidation(r['address'], r['hf'], r['pos'])
+                    )
+                return
+
+            raw_tx, total_debt, profit_usd, n_built = result
+            submit_result = await blast_submit_ex(raw_tx)
+            tx_hash = submit_result.tx_hash
+
+            if tx_hash:
+                await self.nonce_mgr.mark_submitted(nonce)
+                for r in group:
+                    await self.tracker.add(
+                        r['address'], tx_hash, nonce,
+                        collateral_asset=r['collateral_asset'],
+                        debt_asset=debt_asset,
+                        estimated_profit=r['profit_usd'],
+                    )
+                elapsed = (time.monotonic() - t0) * 1000
+                logger.info(
+                    f"[Batch] SUBMITTED N={n_built} hash={tx_hash[:12]}… "
+                    f"debt={debt_asset[:10]}… profit=${profit_usd:.2f} "
+                    f"in {elapsed:.0f}ms"
+                )
+            elif submit_result.status == "ambiguous":
+                await self.nonce_mgr.mark_submitted(nonce)
+                logger.warning(f"[Batch] Ambiguous submit — nonce {nonce} held")
+            else:
+                await self.nonce_mgr.rewind()
+                logger.warning(f"[Batch] Submit hard-failed — rewinding nonce")
+
+        except Exception as e:
+            logger.error(f"[Batch] _execute_batch error: {e}", exc_info=True)
+        finally:
+            for addr in addresses:
+                self._in_flight.discard(addr)
 
     async def _execute_liquidation(self, address: str, hf: float, pos):
         t0 = time.monotonic()
-        self._in_flight.add(address)
+        self._in_flight.add(address)  # re-add (cleared by _flush_batch single fallback)
         try:
             account_data = self.loader.get(address)
             if account_data is None:
