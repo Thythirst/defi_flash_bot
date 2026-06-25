@@ -92,6 +92,17 @@ struct LiquidationRoute {
     bytes swapCalldata;   // empty if no swap needed
 }
 
+// One position in a batch. All items in a batch share a single debtAsset
+// (passed separately) so they can be covered by one flash loan / one nonce.
+struct BatchItem {
+    address collateralAsset;
+    address borrower;
+    uint256 debtToCover;
+    bool receiveAToken;
+    address swapRouter;   // address(0) if no swap needed
+    bytes swapCalldata;   // collateral->debt swap, empty if same asset
+}
+
 // ─── Events ─────────────────────────────────────────────────
 event LiquidationExecuted(
     address indexed borrower,
@@ -145,8 +156,19 @@ contract FlashExecutorV3 is Ownable, ReentrancyGuard, Pausable, IFlashLoanRecipi
     // Prevents rescue while a flash loan is in-flight (re-entrant safety)
     bool private _flashLocked;
 
+    // Set while a batch flash loan is in flight so the shared Balancer callback
+    // knows to decode batch userData instead of a single LiquidationRoute.
+    bool private _batchInProgress;
+
     modifier onlyVault() {
         if (msg.sender != address(BALANCER_VAULT)) revert UnauthorizedCallback(msg.sender);
+        _;
+    }
+
+    // Restricts the per-item liquidation step to internal self-calls, so the
+    // batch loop can wrap each item in try/catch (try/catch needs an external call).
+    modifier onlySelf() {
+        if (msg.sender != address(this)) revert UnauthorizedCallback(msg.sender);
         _;
     }
 
@@ -266,6 +288,58 @@ contract FlashExecutorV3 is Ownable, ReentrancyGuard, Pausable, IFlashLoanRecipi
             revert FlashLoanFailed();
         }
 
+        _flashLocked = false;
+    }
+
+    // ─── Batch Liquidation Entry (#4) ──────────────────────────
+    /**
+     * @notice Liquidate many positions sharing one debtAsset in a SINGLE tx /
+     *         single nonce, funded by one Balancer flash loan of the summed debt.
+     *         Per-item failures are isolated (try/catch) so one reverting position
+     *         does not kill the rest. Profit is validated in aggregate.
+     * @param debtAsset  The common debt asset for every item (one flash loan).
+     * @param items      Positions to liquidate.
+     */
+    function executeLiquidationBatch(
+        address debtAsset,
+        BatchItem[] calldata items
+    ) external onlyOwner whenNotPaused {
+        if (debtAsset == address(0) || items.length == 0) revert InvalidParameters();
+
+        uint256 totalDebt;
+        for (uint256 i = 0; i < items.length; i++) {
+            if (items[i].borrower == address(0) || items[i].debtToCover == 0) {
+                revert InvalidParameters();
+            }
+            if (items[i].swapRouter != address(0) && !approvedRouters[items[i].swapRouter]) {
+                revert RouterNotApproved(items[i].swapRouter);
+            }
+            totalDebt += items[i].debtToCover;
+        }
+
+        address[] memory tokens = new address[](1);
+        tokens[0] = debtAsset;
+        uint256[] memory amounts = new uint256[](1);
+        amounts[0] = totalDebt;
+
+        _flashLocked = true;
+        _batchInProgress = true;
+
+        try BALANCER_VAULT.flashLoan(address(this), tokens, amounts, abi.encode(debtAsset, items)) {
+            // success
+        } catch Error(string memory reason) {
+            _batchInProgress = false;
+            _flashLocked = false;
+            emit LiquidationFailed(address(0), reason, block.number);
+            revert FlashLoanFailed();
+        } catch (bytes memory) {
+            _batchInProgress = false;
+            _flashLocked = false;
+            emit LiquidationFailed(address(0), "batchLowLevelRevert", block.number);
+            revert FlashLoanFailed();
+        }
+
+        _batchInProgress = false;
         _flashLocked = false;
     }
 
@@ -439,6 +513,17 @@ contract FlashExecutorV3 is Ownable, ReentrancyGuard, Pausable, IFlashLoanRecipi
         uint256[] memory feeAmounts,
         bytes memory userData
     ) external onlyVault nonReentrant {
+        // Batch path (#4): userData is (address debtAsset, BatchItem[] items)
+        if (_batchInProgress) {
+            (address batchDebtAsset, BatchItem[] memory items) =
+                abi.decode(userData, (address, BatchItem[]));
+            if (tokens.length != 1 || tokens[0] != batchDebtAsset) {
+                revert FlashLoanMismatch(batchDebtAsset, amounts.length > 0 ? amounts[0] : 0);
+            }
+            _doBatch(batchDebtAsset, items, amounts[0], feeAmounts[0]);
+            return;
+        }
+
         LiquidationRoute memory route = abi.decode(userData, (LiquidationRoute));
 
         // Validate flash loan matches what we requested
@@ -566,6 +651,105 @@ contract FlashExecutorV3 is Ownable, ReentrancyGuard, Pausable, IFlashLoanRecipi
             profit,
             block.number
         );
+    }
+
+    // ─── Batch Liquidation Logic (#4) ─────────────────────────
+    /**
+     * @notice Run every item against one flash loan, isolating per-item reverts,
+     *         then repay once and validate aggregate profit.
+     * @param debtAsset  Common debt asset (the flash-loaned token).
+     * @param items      Positions to liquidate.
+     * @param principal  Flash-loaned amount (sum of debtToCover).
+     * @param fee        Flash loan fee (0 for Balancer on Arbitrum).
+     */
+    function _doBatch(
+        address debtAsset,
+        BatchItem[] memory items,
+        uint256 principal,
+        uint256 fee
+    ) internal {
+        uint256 balanceBefore = IERC20(debtAsset).balanceOf(address(this));
+        if (balanceBefore < principal) revert InsufficientBalance();
+
+        uint256 succeeded;
+        for (uint256 i = 0; i < items.length; i++) {
+            // External self-call so a single bad position reverts only its own
+            // state changes (caught here) instead of aborting the whole batch.
+            try this.doOneLiquidationStep(debtAsset, items[i]) {
+                succeeded++;
+                emit LiquidationExecuted(
+                    items[i].borrower,
+                    items[i].collateralAsset,
+                    debtAsset,
+                    items[i].debtToCover,
+                    0,                // per-item profit not isolated; see aggregate
+                    block.number
+                );
+            } catch Error(string memory reason) {
+                emit LiquidationFailed(items[i].borrower, reason, block.number);
+            } catch (bytes memory) {
+                emit LiquidationFailed(items[i].borrower, "itemReverted", block.number);
+            }
+        }
+
+        // Repay once + aggregate profit gate.
+        uint256 totalOwed = principal + fee;
+        uint256 balanceAfter = IERC20(debtAsset).balanceOf(address(this));
+        uint256 threshold = _minProfitForAsset(debtAsset);
+        if (balanceAfter < totalOwed + threshold) {
+            revert NotProfitable(balanceAfter, totalOwed + threshold);
+        }
+
+        IERC20(debtAsset).safeTransfer(address(BALANCER_VAULT), totalOwed);
+    }
+
+    /**
+     * @notice One position's liquidationCall + optional collateral->debt swap.
+     *         No repayment here — the batch repays once after the loop.
+     * @dev    onlySelf so it is only reachable via the try/catch in _doBatch.
+     */
+    function doOneLiquidationStep(
+        address debtAsset,
+        BatchItem calldata item
+    ) external onlySelf {
+        // Step 1: Aave liquidationCall
+        IERC20(debtAsset).forceApprove(address(AAVE_POOL), item.debtToCover);
+        (bool liqSuccess, bytes memory liqReturnData) = address(AAVE_POOL).call(
+            abi.encodeWithSelector(
+                IAavePool.liquidationCall.selector,
+                item.collateralAsset,
+                debtAsset,
+                item.borrower,
+                item.debtToCover,
+                item.receiveAToken
+            )
+        );
+        if (!liqSuccess) {
+            if (liqReturnData.length > 0) {
+                assembly { revert(add(liqReturnData, 32), mload(liqReturnData)) }
+            } else {
+                revert LiquidationCallFailed();
+            }
+        }
+        IERC20(debtAsset).forceApprove(address(AAVE_POOL), 0);
+
+        // Step 2: optional collateral -> debt swap
+        if (item.swapRouter != address(0) && item.swapCalldata.length > 0) {
+            if (!approvedRouters[item.swapRouter]) revert RouterNotApproved(item.swapRouter);
+            uint256 collateralBalance = IERC20(item.collateralAsset).balanceOf(address(this));
+            if (collateralBalance > 0) {
+                IERC20(item.collateralAsset).forceApprove(item.swapRouter, collateralBalance);
+                (bool swapSuccess, bytes memory swapReturnData) = item.swapRouter.call(item.swapCalldata);
+                if (!swapSuccess) {
+                    if (swapReturnData.length > 0) {
+                        assembly { revert(add(swapReturnData, 32), mload(swapReturnData)) }
+                    } else {
+                        revert SwapFailed();
+                    }
+                }
+                IERC20(item.collateralAsset).forceApprove(item.swapRouter, 0);
+            }
+        }
     }
 
     // ─── Rescues ──────────────────────────────────────────────
