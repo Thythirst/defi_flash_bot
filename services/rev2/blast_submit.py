@@ -29,6 +29,31 @@ class Endpoint:
     timeout_ms: int = 2000
 
 
+@dataclass
+class SubmitResult:
+    """Rich submission outcome so the caller can manage the nonce correctly.
+
+    status:
+      "accepted"  — an endpoint returned a tx hash; tx is in a mempool.
+      "ambiguous" — no hash, but at least one endpoint timed out or reported
+                    already-known/nonce-too-low/replacement. The tx may be
+                    in-flight (private/slow mempool). The caller MUST NOT reuse
+                    this nonce, or it will collide with the in-flight tx.
+      "failed"    — every endpoint hard-rejected the tx (e.g. insufficient
+                    funds, intrinsic gas, malformed). Safe to reclaim the nonce.
+    """
+    tx_hash: Optional[str]
+    status: str  # "accepted" | "ambiguous" | "failed"
+
+    def __bool__(self) -> bool:
+        return self.tx_hash is not None
+
+
+# Keep strong refs to fire-and-forget redundancy submissions so the event loop
+# does not garbage-collect them mid-flight after blast_submit() returns early.
+_BG_TASKS: set = set()
+
+
 # Populated by configure_endpoints() — call once at startup
 _ENDPOINTS: list[Endpoint] = []
 _SESSION: Optional[aiohttp.ClientSession] = None
@@ -56,14 +81,18 @@ def configure_endpoints(
         flashbots_url:   public arb1 (Ethereum-only Flashbots replaced)
     """
     global _ENDPOINTS
-    public_arb1 = "https://arb1.arbitrum.io/rpc"
+    # #2 fix: dropped the 2 public arb1 endpoints. Their 5s timeouts were the
+    # dominant source of blast_submit() returning None on txs that had actually
+    # been broadcast — which poisoned nonce tracking and caused collisions
+    # (see the timeout→None→rewind→nonce-reuse chain). primary (DRPC) and
+    # secondary (BlastAPI) are both fast and reliable (159/159 accepted in prod).
+    # Timeout tightened to 2.5s — reliable endpoints answer in ~100-200ms, so a
+    # longer wait only delays the ambiguous-failure decision.
     _ENDPOINTS = [
-        Endpoint(name="primary",    url=primary_rpc,    timeout_ms=5000),
-        Endpoint(name="secondary",  url=secondary_rpc,  timeout_ms=5000),
-        Endpoint(name="arb1_a",     url=public_arb1,    timeout_ms=5000),
-        Endpoint(name="arb1_b",     url=public_arb1,    timeout_ms=5000),
+        Endpoint(name="primary",    url=primary_rpc,    timeout_ms=2500),
+        Endpoint(name="secondary",  url=secondary_rpc,  timeout_ms=2500),
     ]
-    logger.info(f"[BlastSubmit] Configured {len(_ENDPOINTS)} endpoints: primary({primary_rpc[:40]}) + secondary + 2x arb1")
+    logger.info(f"[BlastSubmit] Configured {len(_ENDPOINTS)} endpoints: primary({primary_rpc[:40]}) + secondary (arb1 dropped — fix #2)")
 
 
 async def _get_session() -> aiohttp.ClientSession:
@@ -140,18 +169,33 @@ async def _submit_to_endpoint(
         return endpoint.name, None, str(e)
 
 
-async def blast_submit(raw_tx: bytes) -> Optional[str]:
+# Endpoint error strings that mean "the tx may already be in a mempool" —
+# i.e. an ambiguous outcome where reusing the nonce would collide.
+_AMBIGUOUS_ERRORS = ("already_known", "timeout")
+_AMBIGUOUS_SUBSTRINGS = ("already known", "nonce too low", "replacement",
+                         "known transaction", "already imported")
+
+
+def _is_ambiguous(error: Optional[str]) -> bool:
+    if not error:
+        return False
+    e = error.lower()
+    if error in _AMBIGUOUS_ERRORS:
+        return True
+    return any(s in e for s in _AMBIGUOUS_SUBSTRINGS)
+
+
+async def blast_submit_ex(raw_tx: bytes) -> SubmitResult:
     """
-    Submit a signed raw transaction to all configured endpoints in parallel.
-    Returns the first tx_hash received, or None if all endpoints fail.
+    Submit a signed raw transaction to all configured endpoints in parallel and
+    return a SubmitResult describing the outcome (accepted / ambiguous / failed).
 
-    Replaces:
-        tx_hash = self.w3.eth.send_raw_transaction(presigned.raw_tx)
-    With:
-        tx_hash = await blast_submit(presigned.raw_tx)
+    Returns as soon as the FIRST endpoint accepts (fastest-wins) — remaining
+    endpoints keep submitting in the background for redundancy/propagation.
 
-    Args:
-        raw_tx: signed transaction bytes (as returned by sign_transaction)
+    The accepted/ambiguous/failed distinction lets the caller manage the nonce
+    correctly: only "failed" (every endpoint hard-rejected) is safe to rewind;
+    "ambiguous" means the tx may be in-flight and the nonce must be held.
     """
     if not _ENDPOINTS:
         raise RuntimeError(
@@ -173,11 +217,10 @@ async def blast_submit(raw_tx: bytes) -> Optional[str]:
         for ep in _ENDPOINTS
     ]
 
-    first_hash: Optional[str] = None
     errors: list[str] = []
+    saw_ambiguous = False
     pending = set(tasks)
 
-    # Return as soon as the first endpoint accepts, let others finish async
     while pending:
         done, pending = await asyncio.wait(
             pending,
@@ -185,31 +228,39 @@ async def blast_submit(raw_tx: bytes) -> Optional[str]:
         )
         for task in done:
             name, tx_hash, error = task.result()
-            if tx_hash and not first_hash:
-                first_hash = tx_hash
-                logger.info(f"[BlastSubmit] First confirmation from {name}: {tx_hash}")
-                # Cancel remaining only if all MEV-protected endpoints already submitted
-                # (let mev_blocker and flashbots always fire for protection)
-                non_mev_done = all(
-                    t.done() for t in tasks
-                    if not any(ep.name in t.get_name() for ep in _ENDPOINTS if ep.is_mev_blocker)
-                )
-                if non_mev_done:
-                    for p in pending:
-                        p.cancel()
-                    break
-            elif error and error != "already_known":
+            if tx_hash:
+                # Fastest-wins: return immediately. Let the still-pending
+                # endpoints finish in the background for redundancy (keep a
+                # strong ref so they aren't GC'd mid-flight).
+                logger.info(f"[BlastSubmit] First accept from {name}: {tx_hash}")
+                for p in pending:
+                    _BG_TASKS.add(p)
+                    p.add_done_callback(_BG_TASKS.discard)
+                return SubmitResult(tx_hash=tx_hash, status="accepted")
+            if _is_ambiguous(error):
+                saw_ambiguous = True
+            elif error:
                 errors.append(f"{name}:{error}")
 
-    if not first_hash:
-        # Check if any "already_known" — tx may have landed via a prior attempt
-        all_errors = [task.result()[2] for task in tasks if task.done()]
-        if all(e == "already_known" for e in all_errors if e):
-            logger.info("[BlastSubmit] All endpoints report already_known — tx likely landed")
-        else:
-            logger.error(f"[BlastSubmit] All endpoints failed: {errors}")
+    # No endpoint returned a hash.
+    if saw_ambiguous:
+        logger.warning(
+            "[BlastSubmit] No hash but ambiguous (timeout/already-known) — "
+            "tx may be in-flight; holding nonce. errors=%s", errors
+        )
+        return SubmitResult(tx_hash=None, status="ambiguous")
 
-    return first_hash
+    logger.error(f"[BlastSubmit] All endpoints hard-failed: {errors}")
+    return SubmitResult(tx_hash=None, status="failed")
+
+
+async def blast_submit(raw_tx: bytes) -> Optional[str]:
+    """
+    Backward-compatible wrapper: returns the tx hash on success, else None.
+    Callers that need the accepted/ambiguous/failed distinction (for nonce
+    management) should call blast_submit_ex() directly.
+    """
+    return (await blast_submit_ex(raw_tx)).tx_hash
 
 
 # ---------------------------------------------------------------------------

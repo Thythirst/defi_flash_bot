@@ -36,7 +36,7 @@ sys.path.insert(0, str(project_root))
 sys.path.insert(0, str(project_root / "services" / "rev2"))
 
 from position_loader     import PositionLoader
-from blast_submit        import configure_endpoints, blast_submit, close_session
+from blast_submit        import configure_endpoints, blast_submit, blast_submit_ex, close_session
 from liq_log_parser      import parse_liquidation_log
 from async_web3          import AsyncRPCClient, NonceManager, QuoterAsync
 from execution_guards    import ConfirmationTracker, PresignedTxGuard, PriceRegistry, PresignedSnapshot
@@ -1109,7 +1109,8 @@ class LiquidationPipelineV3:
             )
 
         # ── Submit ─────────────────────────────────────────────────────
-        tx_hash = await blast_submit(raw_tx)
+        result  = await blast_submit_ex(raw_tx)
+        tx_hash = result.tx_hash
 
         if tx_hash:
             await self.nonce_mgr.mark_submitted(nonce)
@@ -1121,12 +1122,24 @@ class LiquidationPipelineV3:
                 f"[Submit] Submitted — hash={tx_hash[:12]}… "
                 f"borrower={borrower[:10]}… nonce={nonce}"
             )
+        elif result.status == "ambiguous":
+            # #1 fix: timeout / already-known — the tx may be in a private or slow
+            # mempool. Do NOT rewind; hold the nonce via mark_submitted so the next
+            # cascade liquidation doesn't reuse it and collide with this in-flight tx.
+            await self.nonce_mgr.mark_submitted(nonce)
+            self.skip_tel.record(SkipEvent(
+                borrower = borrower,
+                reason   = SkipReason.SUBMIT_FAILED,
+                detail   = "blast_submit ambiguous (timeout/already-known) — nonce held, not reused",
+            ))
         else:
+            # status == "failed": every endpoint hard-rejected the tx → the nonce
+            # was never consumed, so it is safe to reclaim it for the next attempt.
             await self.nonce_mgr.rewind()
             self.skip_tel.record(SkipEvent(
                 borrower = borrower,
                 reason   = SkipReason.SUBMIT_FAILED,
-                detail   = "blast_submit returned None — all 4 endpoints failed",
+                detail   = "blast_submit hard-failed — all endpoints rejected",
             ))
 
         return tx_hash
