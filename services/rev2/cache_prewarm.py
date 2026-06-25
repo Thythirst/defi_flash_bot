@@ -258,11 +258,13 @@ class CachePrewarmer:
                 skips_this_cycle += 1
                 continue
 
-            # Skip if in dust cache — position was dead/dust <5 min ago
+            # Skip if in dust cache — position failed to build recently.
+            # TTL=60s (2-3 cycles) — short enough to recover quickly when market
+            # conditions change; long enough not to hammer ghost positions every cycle.
             if addr_lower in self._dust_cache:
                 cached_hf, cached_ts = self._dust_cache[addr_lower]
                 hf_unchanged = abs(hf - cached_hf) < 0.001
-                if hf_unchanged and (time.time() - cached_ts) < 300:
+                if hf_unchanged and (time.time() - cached_ts) < 60:
                     dust_skips += 1
                     continue  # still dust, skip rebuild
 
@@ -271,7 +273,7 @@ class CachePrewarmer:
             # when stale so we don't leave them unwarmed after a transient failure.
             if addr_lower not in self._ever_built and addr_lower in self._profit_cache:
                 cached_profit, cached_ts = self._profit_cache[addr_lower]
-                if cached_profit < 0.01 and (time.time() - cached_ts) < 300:
+                if cached_profit < 0.01 and (time.time() - cached_ts) < 60:
                     dust_skips += 1
                     continue  # sub-cent profit on never-built position, skip rebuild
 
