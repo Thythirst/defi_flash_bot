@@ -139,4 +139,41 @@ contract BatchLiquidationTest is Test {
         vm.expectRevert(InvalidParameters.selector);
         exec.executeLiquidationBatch(address(debt), empty);
     }
+
+    // ─── Gas scaling (#5 tuning for MAX_ITEMS_PER_BATCH) ───────────
+    // Measures the BATCHING-SPECIFIC gas: flash-loan accounting + loop +
+    // per-item try/catch + (mock) liquidationCall/swap. NOTE: real Aave
+    // liquidationCall + real DEX swap add ~300-600k gas PER ITEM on mainnet
+    // that the mocks don't model — so on-chain total ≈ this + N*~450k.
+    // Use this to confirm the orchestration overhead stays ~linear and to
+    // bound MAX_ITEMS_PER_BATCH against Arbitrum's practical per-tx gas.
+    function _buildN(uint256 n) internal view returns (BatchItem[] memory items) {
+        items = new BatchItem[](n);
+        for (uint256 i = 0; i < n; i++) {
+            items[i] = _item(address(uint160(0x1000 + i)), 1000e18);
+        }
+    }
+
+    function _measure(uint256 n) internal returns (uint256 used) {
+        BatchItem[] memory items = _buildN(n);
+        uint256 g0 = gasleft();
+        exec.executeLiquidationBatch(address(debt), items);
+        used = g0 - gasleft();
+        emit log_named_uint(string.concat("batch gas N=", vm.toString(n)), used);
+        emit log_named_uint("  per-item (mock)", used / n);
+    }
+
+    function test_gas_batch_scaling() public {
+        uint256 g1  = _measure(1);
+        uint256 g4  = _measure(4);
+        uint256 g8  = _measure(8);
+        uint256 g12 = _measure(12);
+        // Marginal per-item should be ~stable (linear) — assert no superlinear blowup.
+        uint256 marg = (g12 - g1) / 11;
+        emit log_named_uint("marginal gas/item (mock)", marg);
+        // Projected on-chain total at N=12 with ~450k real gas/item added:
+        emit log_named_uint("projected on-chain N=12 (=mock + 12*450k)", g12 + 12 * 450_000);
+        assertLt(g12, g1 * 13, "batch gas must stay ~linear, not superlinear");
+        assertGt(g8, g4, "more items => more gas (sanity)");
+    }
 }
