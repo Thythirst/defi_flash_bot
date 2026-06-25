@@ -22,7 +22,6 @@ from __future__ import annotations
 
 import asyncio
 import base64
-import collections
 import json
 import logging
 import struct
@@ -33,7 +32,6 @@ from typing import Awaitable, Callable, Optional
 import rlp
 import websockets
 from eth_abi import decode as abi_decode
-from eth_utils import keccak
 
 logger = logging.getLogger(__name__)
 
@@ -97,30 +95,6 @@ SEL_UR_EXECUTE_NO_DL    = bytes.fromhex("24856bc3")  # execute(bytes,bytes[])
 UR_CMD_MASK             = 0x3f
 UR_V3_SWAP_EXACT_IN     = 0x00
 UR_CONTRACT_BALANCE_BIT = 1 << 255   # amountIn sentinel "use contract balance" — unknown size
-# Command-code labels (low 6 bits) for the diagnostic histogram.
-UR_CMD_LABELS = {
-    0x00: "V3_SWAP_EXACT_IN", 0x01: "V3_SWAP_EXACT_OUT",
-    0x08: "V2_SWAP_EXACT_IN", 0x09: "V2_SWAP_EXACT_OUT",
-    0x0a: "PERMIT2_PERMIT",   0x0b: "WRAP_ETH", 0x0c: "UNWRAP_WETH",
-    0x04: "SWEEP", 0x05: "TRANSFER", 0x06: "PAY_PORTION",
-    0x0d: "PERMIT2_TRANSFER_FROM", 0x21: "EXECUTE_SUB_PLAN",
-}
-
-# --- PHASE 0 INSTRUMENTATION (temporary; remove after starvation measurement) ---
-# Labels for readability of the ranked undecoded-entrypoint report. Lower-case.
-PHASE0_AGG_LABELS = {
-    "0xdef1c0ded9bec7f1a1670819833240f027b25eff": "0x ExchangeProxy (handled)",
-    "0xa669e7a0d4b3e4fa48af2de86bd4cd7126be4e13": "Odos RouterV2",
-    "0xdef171fe48cf0115b1d80b88dc8eab59176fee57": "Paraswap Augustus v5",
-    "0x6a000f20005980200259b80c5102003040001068": "Paraswap Augustus v6",
-    "0x6131b5fae19ea4f9d964eac0408e4408b66337b5": "KyberSwap MetaAgg v2",
-    "0x6352a56caadc4f1e25cd6c75970fa768a3304e64": "OpenOcean",
-    "0xc873fecbd354f5a56e00e710b90ef4201db2448d": "Camelot V2 Router",
-    "0x1111111254eeb25477b68fb85ed929f73a960582": "1inch v5 (handled)",
-    "0x111111125421ca6dc452d289314280a0f8842a65": "1inch v6 (handled)",
-}
-PHASE0_REPORT_EVERY_S = 60.0
-# --- END PHASE 0 INSTRUMENTATION ---
 
 
 @dataclass
@@ -179,7 +153,6 @@ def _unwrap_multicall(sel: bytes, data: bytes) -> list[bytes]:
 def _iter_batch(payload: bytes):
     """
     Yield (to_lower, calldata, raw_tx) tuples from a L2MessageType_batch payload.
-    raw_tx is the signed tx bytes (keccak → tx hash, for feed/WS correlation).
     Length prefix is uint64 big-endian (8 bytes).
     """
     pos = 1  # skip type byte 0x03
@@ -229,44 +202,6 @@ class SequencerFeedWatcher:
         self._running      = False
         self._msgs_seen    = 0
         self._swaps_seen   = 0
-
-        # --- PHASE 0 INSTRUMENTATION (temporary) ---
-        # Set of tracked token addresses as raw 20-byte values, for cheap
-        # substring detection in undecoded calldata (format-agnostic).
-        self._tracked_token_bytes: set[bytes] = set()
-        for p in pool_by_addr.values():
-            for t in (getattr(p, "token0", None), getattr(p, "token1", None)):
-                if isinstance(t, str) and len(t) == 42:
-                    try:
-                        self._tracked_token_bytes.add(bytes.fromhex(t[2:]))
-                    except ValueError:
-                        pass
-        # Known venues we already decode — anything else is an "unknown entrypoint".
-        self._phase0_known = (
-            set(pool_by_addr) | set(ROUTER_ADDRS) | {CAMELOT_ROUTER}
-            | set(ONEINCH_ADDRS) | set(ZEROX_ADDRS) | set(UNIVERSAL_ROUTER_ADDRS)
-        )
-        self._phase0_undecoded: collections.Counter = collections.Counter()  # (to, sel_hex) -> count, touching tracked tokens
-        self._phase0_unknown_total = 0   # all unknown-entrypoint top-level calls
-        self._phase0_touch_total   = 0   # of those, how many touched a tracked token
-        self._phase0_last_report   = time.monotonic()
-        # --- END PHASE 0 INSTRUMENTATION ---
-
-        # --- UR match-rate diagnostic (temporary) ---
-        # Shows where Universal Router V3_SWAP_EXACT_IN flow is lost: a swap on a
-        # pair we don't track at all vs. a tracked pair but a fee tier missing
-        # from pool_by_key vs. the contract-balance sentinel (size unknown).
-        self._tracked_pairs = {(k[0], k[1]) for k in pool_by_key}  # sorted (t0,t1)
-        self._ur_stats: collections.Counter = collections.Counter()
-        self._ur_cmds:  collections.Counter = collections.Counter()  # masked cmd -> count
-        # --- END UR diagnostic ---
-
-        # --- feed/WS correlation: txhash -> monotonic time first seen in feed,
-        # for every pending tx whose calldata references a tracked token. Lets the
-        # WS path measure (a) whether large confirmed swaps were visible as pending
-        # and (b) the lead time = our real same-block latency budget. ---
-        self.seen_hashes: "collections.OrderedDict[bytes, float]" = collections.OrderedDict()
-        self._seen_cap = 40000
 
     def stop(self) -> None:
         self._running = False
@@ -318,81 +253,15 @@ class SequencerFeedWatcher:
                 parsed = _decode_tx(raw)
                 if parsed:
                     to_addr, calldata = parsed
-                    # Record tx hash (feed receipt time) for any tracked-token tx so
-                    # the WS path can correlate confirmed swaps + measure lead time.
-                    if any(tb in calldata for tb in self._tracked_token_bytes):
-                        self._record_seen(keccak(raw))
                     await self._check(to_addr, calldata)
             elif payload[0] == 3:           # batch
-                for to_addr, calldata, raw in _iter_batch(payload):
-                    if any(tb in calldata for tb in self._tracked_token_bytes):
-                        self._record_seen(keccak(raw))
+                for to_addr, calldata, _raw in _iter_batch(payload):
                     await self._check(to_addr, calldata)
-
-    def _record_seen(self, h: bytes) -> None:
-        self.seen_hashes[h] = time.monotonic()
-        if len(self.seen_hashes) > self._seen_cap:
-            self.seen_hashes.popitem(last=False)
-
-    def feed_seen_at(self, txhash_hex: str) -> Optional[float]:
-        """Monotonic time this tx hash was first seen in the feed, or None."""
-        s = txhash_hex[2:] if txhash_hex.startswith("0x") else txhash_hex
-        try:
-            return self.seen_hashes.get(bytes.fromhex(s))
-        except ValueError:
-            return None
-
-    # --- PHASE 0 INSTRUMENTATION (temporary) ---
-    def _phase0_maybe_report(self) -> None:
-        now = time.monotonic()
-        if now - self._phase0_last_report < PHASE0_REPORT_EVERY_S:
-            return
-        self._phase0_last_report = now
-        top = self._phase0_undecoded.most_common(20)
-        logger.info(
-            f"[SeqFeed PHASE0] unknown-entrypoint calls={self._phase0_unknown_total} "
-            f"touching-tracked-token={self._phase0_touch_total} "
-            f"distinct(to,sel)={len(self._phase0_undecoded)}"
-        )
-        if self._ur_stats:
-            s = self._ur_stats
-            logger.info(
-                f"[SeqFeed UR-DIAG] execute={s['execute']} v3_in={s['v3_in']} "
-                f"matched={s['matched']} | lost: pair_untracked={s['pair_untracked']} "
-                f"fee_untracked={s['fee_untracked']} sentinel/zero={s['sentinel_or_zero']} "
-                f"short_path={s['short_path']} decode_fail={s['decode_fail']}"
-            )
-            cmd_hist = "  ".join(
-                f"{UR_CMD_LABELS.get(c, hex(c))}={n}"
-                for c, n in self._ur_cmds.most_common(8)
-            )
-            logger.info(f"[SeqFeed UR-DIAG] commands: {cmd_hist or '(none)'}")
-        if not top:
-            logger.info("[SeqFeed PHASE0]   (no tracked-token traffic to unknown entrypoints yet)")
-            return
-        logger.info("[SeqFeed PHASE0]   count  selector   entrypoint")
-        for (to_addr, sel_hex), cnt in top:
-            label = PHASE0_AGG_LABELS.get(to_addr, "")
-            logger.info(f"[SeqFeed PHASE0]   {cnt:5d}  0x{sel_hex}  {to_addr} {label}")
-    # --- END PHASE 0 INSTRUMENTATION ---
 
     async def _check(self, to_lower: str, calldata: bytes, depth: int = 0) -> None:
         if len(calldata) < 4:
             return
         sel = calldata[:4]
-
-        # --- PHASE 0 INSTRUMENTATION (temporary, observe-only) ---
-        # Tally top-level calls to entrypoints we do NOT already decode, ranking
-        # those whose calldata references a tracked token (a candidate swap that
-        # is currently invisible to the backrun path). Pure measurement — does
-        # not alter routing below.
-        if depth == 0 and to_lower not in self._phase0_known:
-            self._phase0_unknown_total += 1
-            if any(tb in calldata for tb in self._tracked_token_bytes):
-                self._phase0_touch_total += 1
-                self._phase0_undecoded[(to_lower, sel.hex())] += 1
-        self._phase0_maybe_report()
-        # --- END PHASE 0 INSTRUMENTATION ---
 
         if to_lower in self._pool_by_addr:
             if sel == SEL_POOL_SWAP:
@@ -666,20 +535,10 @@ class SequencerFeedWatcher:
                 commands, inputs = abi_decode(["bytes", "bytes[]"], data)
         except Exception:
             return
-        # Only tally the diagnostic for UR calls that reference a tracked token —
-        # otherwise NFT/Seaport traffic (which never resolves to our pools) swamps
-        # the histogram and hides the real swap-command distribution.
-        diag = any(tb in data for tb in self._tracked_token_bytes)
-        if diag:
-            self._ur_stats["execute"] += 1
         for i, cmd_byte in enumerate(commands):
             cmd = cmd_byte & UR_CMD_MASK
-            if diag:
-                self._ur_cmds[cmd] += 1
             if cmd != UR_V3_SWAP_EXACT_IN:
                 continue
-            if diag:
-                self._ur_stats["v3_in"] += 1
             if i >= len(inputs):
                 break
             try:
@@ -687,13 +546,10 @@ class SequencerFeedWatcher:
                     ["address", "uint256", "uint256", "bytes", "bool"], inputs[i]
                 )
             except Exception:
-                self._ur_stats["decode_fail"] += 1
                 continue
             if amount_in <= 0 or amount_in >= UR_CONTRACT_BALANCE_BIT:
-                self._ur_stats["sentinel_or_zero"] += 1
                 continue  # zero or contract-balance sentinel — size unknown
             if len(path) < 43:
-                self._ur_stats["short_path"] += 1
                 continue
             ti  = self._norm_eth("0x" + path[0:20].hex())
             fee = int.from_bytes(path[20:23], "big")
@@ -701,11 +557,5 @@ class SequencerFeedWatcher:
             t0, t1 = sorted([ti, to])
             pool = self._pool_by_key.get((t0, t1, fee))
             if pool is None:
-                # Diagnose the miss: tracked pair w/ missing fee tier, vs untracked pair.
-                if (t0, t1) in self._tracked_pairs:
-                    self._ur_stats["fee_untracked"] += 1
-                else:
-                    self._ur_stats["pair_untracked"] += 1
                 continue
-            self._ur_stats["matched"] += 1
             await self._emit_for_pool(pool, ti, to, int(amount_in))

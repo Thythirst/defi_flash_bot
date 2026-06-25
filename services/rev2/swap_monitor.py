@@ -567,7 +567,6 @@ class SwapMonitor:
         self._arb_lock       = asyncio.Lock()
         self._arb_pair_cooldown: dict[str, float] = {}
         self._arb_executed   = 0
-        self._feed_shadow_hits = 0     # shadow predictions that real quotes confirmed
 
         # Sequencer feed
         self._feed_pair_cooldown: dict[str, float] = {}  # 5s cooldown per pair (feed path)
@@ -580,13 +579,6 @@ class SwapMonitor:
         self._opportunities  = 0
         self._alerts_sent    = 0
         self._poll_events    = 0
-        # feed/WS correlation: of large confirmed swaps on our pools, how many were
-        # visible as pending in the sequencer feed, and with what lead time (= the
-        # real same-block latency budget). Answers "is the bottleneck latency or
-        # visibility" before spending on colocation.
-        self._corr_large     = 0          # large swaps we tried to correlate (WS path, had txhash)
-        self._corr_seen      = 0          # of those, found in the feed as pending
-        self._corr_lead_ms: deque = deque(maxlen=200)
 
     async def start(self) -> None:
         connector = aiohttp.TCPConnector(limit=10, keepalive_timeout=30, enable_cleanup_closed=True)
@@ -841,17 +833,6 @@ class SwapMonitor:
             f"  {pool_label(pool)}"
             f"  price={price:.6g}"
         )
-
-        # Correlate this confirmed large swap against the sequencer feed: was its
-        # pending tx visible, and how early? (Only the WS path carries a txHash.)
-        txh = log.get("transactionHash")
-        if txh is not None and self._feed_watcher is not None:
-            txh_hex = txh.hex() if hasattr(txh, "hex") else str(txh)
-            self._corr_large += 1
-            seen_at = self._feed_watcher.feed_seen_at(txh_hex)
-            if seen_at is not None:
-                self._corr_seen += 1
-                self._corr_lead_ms.append((time.monotonic() - seen_at) * 1000.0)
 
         # Check cross-DEX spread
         await self._check_spread(pool, amount0, amount1, usd, price)
@@ -1293,14 +1274,6 @@ class SwapMonitor:
                 pre_buy_out  = real_buy_out,
                 slippage_bps = FEED_SLIPPAGE,
             ))
-        else:
-            # Shadow: score the prediction against the real round trip ~1 block
-            # later — measures BOTH prediction accuracy and how fast the gap decays.
-            asyncio.create_task(self._score_shadow(
-                token_in, token_out, amount_in, buy_pool, sell_pool,
-                predicted_net=net_usd, edge_pct=edge * 100, would_fire=would_fire,
-            ))
-
     async def _quote_pool(self, pool: PoolInfo, token_in: str, token_out: str,
                           amount_in: int) -> Optional[int]:
         """Direct single-pool quote (bypasses the rate limiter). Returns amount_out."""
@@ -1346,39 +1319,6 @@ class SwapMonitor:
         net_usd   = gross_usd - self._price_engine.gas_cost_usd()
         probe_usd = amount_in / 10 ** dec_in * price_in
         return net_usd, gross_usd, buy_pool, sell_pool, probe_usd
-
-    async def _score_shadow(self, token_in: str, token_out: str, amount_in: int,
-                            buy_pool: PoolInfo, sell_pool: PoolInfo,
-                            predicted_net: float, edge_pct: float,
-                            would_fire: bool = False, delay: float = 1.5) -> None:
-        """
-        SHADOW validation: ~1 block after a predicted backrun, quote the REAL
-        two-leg round trip and report whether it would actually have been
-        profitable. Builds confidence (or not) in the prediction before any
-        real money is risked.
-        """
-        await asyncio.sleep(delay)
-        try:
-            buy_out = await self._quote_pool(buy_pool, token_in, token_out, amount_in)
-            if not buy_out:
-                return
-            a_back = await self._quote_pool(sell_pool, token_out, token_in, buy_out)
-            if not a_back:
-                return
-            dec_in = TOKEN_DECIMALS.get(_to_checksum(token_in), 18)
-            pu     = self._price_engine.prices_usd.get(_to_checksum(token_in), 0.0)
-            actual_net = (a_back - amount_in) / 10 ** dec_in * pu - self._price_engine.gas_cost_usd()
-            confirmed = actual_net >= MIN_EXECUTE_USD
-            if confirmed:
-                self._feed_shadow_hits += 1
-            logger.info(
-                f"[SeqFeed SHADOW] score: would_fire={would_fire} "
-                f"predicted est_net=${predicted_net:.2f} edge={edge_pct:.3f}% | "
-                f"ACTUAL round-trip net=${actual_net:+.2f} "
-                f"{'PROFITABLE ✓' if confirmed else 'unprofitable'} (t+{delay:.1f}s)"
-            )
-        except Exception as e:
-            logger.debug(f"[SeqFeed SHADOW] score failed: {e}")
 
     async def _poll_loop(self, pools: list[PoolInfo]) -> None:
         """
@@ -1478,14 +1418,6 @@ class SwapMonitor:
             feed_swaps= getattr(self._feed_watcher, "_swaps_seen", 0) if self._feed_watcher else 0
             feed_mode = ("off" if self._arb_executor is None
                          else ("live" if self._arb_live else "shadow"))
-            if self._corr_lead_ms:
-                sorted_lead = sorted(self._corr_lead_ms)
-                med_lead = sorted_lead[len(sorted_lead) // 2]
-                lead_str = f"{med_lead:.0f}ms(median,n={len(sorted_lead)})"
-            else:
-                lead_str = "n/a"
-            corr_str = (f"{self._corr_seen}/{self._corr_large} lead={lead_str}"
-                        if self._corr_large else "0/0")
             logger.info(
                 f"[Stats] swaps_seen={self._swaps_seen}"
                 f"  large={self._swaps_large}"
@@ -1494,9 +1426,7 @@ class SwapMonitor:
                 f"  arb_executed={self._arb_executed}"
                 f"  feed_msgs={feed_msgs}  feed_swaps={feed_swaps}"
                 f"  feed[{feed_mode}]_fired={self._feed_fired}"
-                f"  shadow_confirmed={self._feed_shadow_hits}"
                 f"  poll_events={self._poll_events}"
-                f"  feed_seen={corr_str}"
                 f"  ws={ws_status}"
             )
 
