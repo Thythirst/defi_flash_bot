@@ -647,9 +647,20 @@ class LiquidationPipelineV3:
             else:
                 debt_to_cover = result.debt_to_cover  # fallback to selector's estimate
 
-            # Estimate collateral amount received (debt × bonus multiplier)
-            bonus_mult        = result.liquidation_bonus_bps / 10_000
-            collateral_amount = int(debt_to_cover * bonus_mult)
+            # Estimate collateral amount received, in collateral-token raw units.
+            # Must convert via oracle price ratio — raw-unit multiplication is only
+            # correct for same-asset pairs (where col_price == debt_price and decimals match).
+            bonus_mult    = result.liquidation_bonus_bps / 10_000
+            col_asset     = result.asset
+            col_price_raw = prices.get(col_asset, 0)
+            col_dec       = DECIMALS.get(col_asset, 18)
+            if col_price_raw > 0 and debt_price_raw > 0 and col_asset.lower() != best_d.lower():
+                collateral_amount = int(
+                    debt_to_cover * debt_price_raw * (10 ** col_dec) * bonus_mult
+                    / (col_price_raw * (10 ** debt_dec))
+                )
+            else:
+                collateral_amount = int(debt_to_cover * bonus_mult)
 
             # ── Build flash loan tx (nonce=0 placeholder) ───────────────
             tx_data = await self.flash_builder.build(
@@ -907,8 +918,17 @@ class LiquidationPipelineV3:
                 else:
                     debt_to_cover = selection.debt_to_cover
 
-                bonus_mult        = selection.liquidation_bonus_bps / 10_000
-                collateral_amount = int(debt_to_cover * bonus_mult)
+                bonus_mult    = selection.liquidation_bonus_bps / 10_000
+                col_asset     = selection.asset
+                col_price_raw = prices_snap.get(col_asset, 0)
+                col_dec       = DECIMALS.get(col_asset, 18)
+                if col_price_raw > 0 and debt_price_raw > 0 and col_asset.lower() != best_debt.lower():
+                    collateral_amount = int(
+                        debt_to_cover * debt_price_raw * (10 ** col_dec) * bonus_mult
+                        / (col_price_raw * (10 ** debt_dec))
+                    )
+                else:
+                    collateral_amount = int(debt_to_cover * bonus_mult)
 
                 resolved.append({
                     'address':          address,
@@ -967,6 +987,13 @@ class LiquidationPipelineV3:
                 logger.info(
                     f"[Batch] Aggregate profit ${total_profit_usd:.2f} below floor "
                     f"${self.profit_gate.min_profit_usd:.2f} — skipping N={len(group)}"
+                )
+                return
+
+            if total_profit_usd > 100_000:
+                logger.warning(
+                    f"[Batch] Implausible aggregate profit ${total_profit_usd:,.0f} N={len(group)} "
+                    f"— skipping (likely bad oracle quote for cross-asset pair)"
                 )
                 return
 
