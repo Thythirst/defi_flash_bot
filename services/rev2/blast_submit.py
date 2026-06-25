@@ -59,40 +59,36 @@ _ENDPOINTS: list[Endpoint] = []
 _SESSION: Optional[aiohttp.ClientSession] = None
 
 
+_SEQUENCER_URL = "https://arb1-sequencer.arbitrum.io/rpc"
+
+
 def configure_endpoints(
     primary_rpc: str,
     secondary_rpc: str,
     mev_blocker_url: str = "https://arb1.arbitrum.io/rpc",
     flashbots_url: str   = "https://arb1.arbitrum.io/rpc",
+    sequencer_rpc: str   = _SEQUENCER_URL,
 ) -> None:
     """
     Register the submission endpoints.
     Call once at pipeline startup before any blast_submit() calls.
 
-    MEV Blocker (rpc.mevblocker.io) and Flashbots (rpc.flashbots.net) are
-    Ethereum-only — they do not serve Arbitrum. On Arbitrum we run:
-      - QuickNode 22ms (primary)
-      - 3x public arb1 52ms (redundant network paths, same node deduplicates)
-
-    Args:
-        primary_rpc:    QuickNode HTTP 22ms
-        secondary_rpc:  public arb1 52ms
-        mev_blocker_url: public arb1 (Ethereum-only MEV Blocker replaced)
-        flashbots_url:   public arb1 (Ethereum-only Flashbots replaced)
+    On Arbitrum, MEV Blocker and Flashbots are Ethereum-only. We submit to:
+      - primary: paid RPC relay (fastest, most reliable)
+      - secondary: secondary RPC for redundancy
+      - sequencer: arb1-sequencer.arbitrum.io — direct to Arbitrum sequencer,
+                   bypasses relay hops for minimum-latency inclusion
     """
     global _ENDPOINTS
-    # #2 fix: dropped the 2 public arb1 endpoints. Their 5s timeouts were the
-    # dominant source of blast_submit() returning None on txs that had actually
-    # been broadcast — which poisoned nonce tracking and caused collisions
-    # (see the timeout→None→rewind→nonce-reuse chain). primary (DRPC) and
-    # secondary (BlastAPI) are both fast and reliable (159/159 accepted in prod).
-    # Timeout tightened to 2.5s — reliable endpoints answer in ~100-200ms, so a
-    # longer wait only delays the ambiguous-failure decision.
     _ENDPOINTS = [
         Endpoint(name="primary",    url=primary_rpc,    timeout_ms=2500),
         Endpoint(name="secondary",  url=secondary_rpc,  timeout_ms=2500),
+        Endpoint(name="sequencer",  url=sequencer_rpc,  timeout_ms=2500),
     ]
-    logger.info(f"[BlastSubmit] Configured {len(_ENDPOINTS)} endpoints: primary({primary_rpc[:40]}) + secondary (arb1 dropped — fix #2)")
+    logger.info(
+        f"[BlastSubmit] Configured {len(_ENDPOINTS)} endpoints: "
+        f"primary({primary_rpc[:40]}) + secondary + sequencer(direct)"
+    )
 
 
 async def _get_session() -> aiohttp.ClientSession:

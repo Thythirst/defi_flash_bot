@@ -276,7 +276,12 @@ class CachePrewarmer:
                 self._profit_cache[addr_lower] = (profit, time.time())
             else:
                 self._builds_failed += 1
-                self._dust_cache[addr_lower] = (hf, time.time())  # mark as dust
+                # Only dust-cache genuine ghost positions (never built profitably).
+                # Previously-profitable positions may fail transiently (slippage spike,
+                # QuoterV2 hiccup) — let them retry next cycle instead of blocking for 5 min.
+                prev_profit = self._profit_cache.get(addr_lower, (0.0, 0.0))[0]
+                if prev_profit < 0.01:
+                    self._dust_cache[addr_lower] = (hf, time.time())
 
             # Yield between builds — don't starve oracle processing
             await asyncio.sleep(0)
