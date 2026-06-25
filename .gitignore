@@ -24,3 +24,4 @@ node_modules/
 *.db-shm
 *.db-wal
 .env.bak*
+*.py.bak
