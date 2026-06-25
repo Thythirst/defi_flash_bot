@@ -141,6 +141,11 @@ class CachePrewarmer:
         self._profit_cache: dict[str, tuple[float, float]] = {}
         #                                    (profit, timestamp)
 
+        # Tracks addresses that have EVER successfully built a tx (regardless of
+        # profit). These are real positions — don't dust-cache them on transient
+        # rebuild failure (slippage spike, QuoterV2 hiccup). Let them retry next cycle.
+        self._ever_built: set[str] = set()
+
         # Stats
         self._builds_total    = 0
         self._builds_skipped  = 0
@@ -276,11 +281,11 @@ class CachePrewarmer:
                 self._profit_cache[addr_lower] = (profit, time.time())
             else:
                 self._builds_failed += 1
-                # Only dust-cache genuine ghost positions (never built profitably).
-                # Previously-profitable positions may fail transiently (slippage spike,
-                # QuoterV2 hiccup) — let them retry next cycle instead of blocking for 5 min.
-                prev_profit = self._profit_cache.get(addr_lower, (0.0, 0.0))[0]
-                if prev_profit < 0.01:
+                # Only dust-cache genuine ghost positions (never built successfully).
+                # Positions that previously built a tx may fail transiently (slippage
+                # spike, QuoterV2 hiccup) — let them retry next cycle instead of
+                # locking them out for 5 min and leaving warm=0.
+                if addr_lower not in self._ever_built:
                     self._dust_cache[addr_lower] = (hf, time.time())
 
             # Yield between builds — don't starve oracle processing
@@ -383,6 +388,7 @@ class CachePrewarmer:
                     base_fee_at_build = base_fee,
                 )
                 self._builds_total += 1
+                self._ever_built.add(addr.lower())
                 logger.debug(
                     f"[CachePrewarm] Built tx for {addr[:10]}… "
                     f"HF={hf:.4f} profit=\${profit:.2f} in {ms:.0f}ms"
