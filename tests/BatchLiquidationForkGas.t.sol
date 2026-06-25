@@ -30,11 +30,11 @@ contract BatchLiquidationForkGas is Test {
 
     // Real WETH-debt borrowers (collateral != WETH) found on the live watchlist.
     address[5] BORROWERS = [
-        0x8b81420441aC3933C58D1190C8499c2F89Eb1263,
-        0x1424d354526b50a00e1Ff2f7Fc395c5D7126fB6a,
-        0x2c48A579668F76dbf59c20B9273dA9083bE65f52,
-        0x191dc09deF85aBf9Ab4F9f76d802708229bb2cCc,
-        0x60E993F043d02DE1090f6BCB0c7BC6322D4A8eFF
+        0x8b81420441aC3933C58D1190c8499C2F89EB1263,
+        0x1424d354526B50a00E1Ff2f7fC395C5D7126fB6A,
+        0x2C48A579668F76dBF59c20B9273DA9083be65F52,
+        0x191dC09DeF85Abf9ab4f9f76D802708229bB2ccc,
+        0x60e993F043D02De1090f6BCB0c7Bc6322d4A8efF
     ];
     // Collateral asset to seize per borrower (one they actually hold).
     address[5] COLLS = [WBTC, USDC_N, USDC_N, WBTC, WBTC];
