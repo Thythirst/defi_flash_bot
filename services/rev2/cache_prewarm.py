@@ -266,12 +266,14 @@ class CachePrewarmer:
                     dust_skips += 1
                     continue  # still dust, skip rebuild
 
-            # Skip if in profit cache — last build was $0 profit, HF unchanged
-            if addr_lower in self._profit_cache:
+            # Skip if profit cache shows sub-cent — but only for positions that
+            # have NEVER successfully built. Positions in _ever_built always retry
+            # when stale so we don't leave them unwarmed after a transient failure.
+            if addr_lower not in self._ever_built and addr_lower in self._profit_cache:
                 cached_profit, cached_ts = self._profit_cache[addr_lower]
                 if cached_profit < 0.01 and (time.time() - cached_ts) < 300:
                     dust_skips += 1
-                    continue  # sub-cent profit, skip rebuild
+                    continue  # sub-cent profit on never-built position, skip rebuild
 
             # Build presigned tx
             build_ok, profit = await self._build_one(addr, hf, base_fee)
