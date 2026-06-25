@@ -858,10 +858,11 @@ class LiquidationPipelineV3:
 
     async def _flush_batch(self):
         """
-        50ms collection window: drain _batch_queue, group by debt asset,
-        submit batches (N>1) or fall through to the single-position path (N=1).
+        One-tick collection window: yield to the event loop so any other
+        _on_liquidatable calls queued in the same block are processed first,
+        then flush. With colocation + Chainstack, 0ms sleep hits <10ms end-to-end.
         """
-        await asyncio.sleep(0.05)
+        await asyncio.sleep(0)
 
         items, self._batch_queue = self._batch_queue, []
 
@@ -1223,7 +1224,7 @@ class LiquidationPipelineV3:
         # ── CACHE HIT — re-sign with fresh nonce, zero RPC ───────────
         if cached is not None:
             nonce = await self.nonce_mgr.next()
-            tx_data = await self.flash_builder.rebuild_with_nonce(cached, nonce)
+            tx_data = self.flash_builder.rebuild_with_nonce(cached, nonce)
             if tx_data:
                 raw_tx = tx_data.raw_tx
                 logger.debug(
@@ -1264,7 +1265,7 @@ class LiquidationPipelineV3:
 
             # Allocate nonce only now, then re-sign the already-built tx
             nonce = await self.nonce_mgr.next()
-            tx_data = await self.flash_builder.rebuild_with_nonce(tx_data, nonce)
+            tx_data = self.flash_builder.rebuild_with_nonce(tx_data, nonce)
             if tx_data is None:
                 await self.nonce_mgr.rewind()
                 return None

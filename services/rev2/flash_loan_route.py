@@ -669,8 +669,16 @@ class FlashLoanTxBuilder:
         self._swap_builder = SwapCalldataBuilder(rpc.w3, executor_address, quoter=quoter, quote_cache=quote_cache)
         self._validator    = RouteValidator(rpc.w3, executor_address)
 
-        # Sync Web3 for signing only (local operation, no RPC)
+        # Sync Web3 for signing + ABI encoding (local only — no RPC)
         self._sync_w3 = Web3()
+        self._sync_executor = self._sync_w3.eth.contract(
+            address=self._executor_addr,
+            abi=EXECUTOR_ABI,
+        )
+
+        # Flash source cache: {token_lower: (source_str, expiry_monotonic)}
+        # Balancer vault balances shift slowly; 30s TTL eliminates the per-build eth_call.
+        self._flash_source_cache: dict[str, tuple[str, float]] = {}
 
     async def _erc20_balance(self, token: str, holder: str) -> int:
         """Read ERC-20 balanceOf via async eth_call."""
@@ -688,11 +696,22 @@ class FlashLoanTxBuilder:
         """
         Decide which flash loan source to use based on available liquidity.
         Returns 'balancer' (0% fee, preferred) or 'aave' (0.09% fee, deep liquidity).
+        Cache TTL=30s — Balancer vault balances shift slowly and this eliminates
+        one eth_call from the hot path on every cache-hit rebuild.
         """
+        import time as _time
+        key = flash_token.lower()
+        cached = self._flash_source_cache.get(key)
+        if cached and _time.monotonic() < cached[1]:
+            return cached[0]
+
         balancer_balance = await self._erc20_balance(flash_token, BALANCER_VAULT)
 
         if balancer_balance >= amount:
-            return 'balancer'   # 0% fee — preferred when liquidity exists
+            result = 'balancer'
+            # Cache for 30s — vault balance is stable unless a large swap drains it
+            self._flash_source_cache[key] = (result, _time.monotonic() + 30.0)
+            return result
 
         logger.info(
             f"[FlashSource] Balancer short for {flash_token[:10]}…: "
@@ -945,27 +964,20 @@ class FlashLoanTxBuilder:
         except Exception:
             return 0.0
 
-    async def rebuild_with_nonce(
+    def rebuild_with_nonce(
         self,
         cached: "FlashLoanTxData",
         nonce: int,
     ) -> Optional["FlashLoanTxData"]:
         """
         Re-sign a cached FlashLoanTxData with a fresh nonce.
-        Reuses cached swap_route.calldata — ZERO RPC calls, ~2ms total.
+        Fully synchronous — zero RPC calls, zero asyncio overhead, ~0.5ms total.
 
-        This is the cache hit fast path. Replaces flash_builder.build()
-        on cache hits — eliminates 200-500ms of QuoterV2 calls per attempt.
-
-        In _build_and_submit() cache hit block, replace:
-            tx_data = await self.flash_builder.build(cached params...)  # 200-500ms
-        With:
-            tx_data = await self.flash_builder.rebuild_with_nonce(cached, nonce)  # ~2ms
-
-        Async — requires await for build_transaction on AsyncContract.
+        Uses sync ABI encoding via self._sync_executor.encodeABI() to bypass
+        the AsyncContract.build_transaction() async machinery entirely.
         """
         try:
-            # Get gas price — oracle (trailing percentile) or static fallback
+            # Gas price — from oracle or shared_state (both in-memory, no RPC)
             if self._gas_oracle:
                 rec = self._gas_oracle.recommend()
                 max_fee      = rec.max_fee_per_gas
@@ -975,33 +987,36 @@ class FlashLoanTxBuilder:
                 max_fee      = int(base_fee * self.GAS_PREMIUM * 2)
                 priority_fee = max(int(base_fee * 0.5), 1_000_000)
             else:
-                base_fee     = 100_000_000  # 0.1 gwei fallback
+                base_fee     = 100_000_000
                 max_fee      = int(base_fee * self.GAS_PREMIUM * 2)
                 priority_fee = max(int(base_fee * 0.5), 1_000_000)
 
-            # Rebuild tx dict — reuse ALL cached params, only nonce changes
-            # Respect cached flash source (balancer vs aave)
-            if cached.flash_source == 'aave':
-                contract_fn = self._executor.functions.executeLiquidationViaAave
-            else:
-                contract_fn = self._executor.functions.executeLiquidation
-
-            tx_dict = await contract_fn(
-                cached.collateral_asset,
-                cached.debt_asset,
-                cached.borrower,
-                cached.debt_to_cover,
-                False,                       # receiveAToken
-                cached.swap_route.router,
-                cached.swap_route.calldata,  # ← reused, no re-quote
-            ).build_transaction({
+            # Synchronous ABI encoding — no RPC, no async scheduler overhead
+            fn_name = 'executeLiquidationViaAave' if cached.flash_source == 'aave' else 'executeLiquidation'
+            calldata = self._sync_executor.encodeABI(
+                fn_name=fn_name,
+                args=[
+                    cached.collateral_asset,
+                    cached.debt_asset,
+                    cached.borrower,
+                    cached.debt_to_cover,
+                    False,                       # receiveAToken
+                    cached.swap_route.router,
+                    cached.swap_route.calldata,
+                ],
+            )
+            tx_dict = {
+                "to":                    self._executor_addr,
+                "data":                  calldata,
                 "from":                  self._wallet,
-                "nonce":                 nonce,           # ← only thing that changes
+                "nonce":                 nonce,
                 "gas":                   self.GAS_LIMIT_FLASH,
                 "maxFeePerGas":          max_fee,
                 "maxPriorityFeePerGas":  priority_fee,
                 "chainId":               42161,
-            })
+                "type":                  2,
+                "value":                 0,
+            }
 
             # Sign locally — no RPC
             signed = self._sync_w3.eth.account.sign_transaction(tx_dict, self._pk)
