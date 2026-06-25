@@ -55,6 +55,7 @@ from skip_telemetry      import SkipTelemetry, SkipEvent, SkipReason
 from flash_loan_route    import FlashLoanTxBuilder, FlashLoanTxData
 from compound_v3          import CompoundV3Module, COMPOUND_MARKETS
 from wsteth_fix           import WstETHPriceManager
+from lst_depeg_scanner    import LSTDepegScanner
 from quote_cache          import QuoteCache, KNOWN_SLOW_PAIRS
 from aave_base            import AaveBaseModule, BaseChainConfig, BaseFlashLoanTxBuilder
 from gas_oracle           import GasOracle
@@ -112,10 +113,13 @@ logger = logging.getLogger("pipeline_v3")
 
 # ── Config (from .env) ────────────────────────────────────────
 # Centralised RPC provider selection with health-checked rotation.
-# Priority: 1RPC → PublicNode → BlastAPI → public Arb1
+# Priority: DRPC (paid, stable) → PublicNode (free, high limits) → Alchemy
 RPC_CONFIG = RPCProviderConfig.from_env()
-PRIMARY_WSS   = os.getenv("ARBITRUM_WS_URL") or os.getenv("RPC_WSS_URL", "wss://arbitrum-one.publicnode.com")
-SECONDARY_WSS = os.getenv("RPC_WSS_URL", "wss://arbitrum-one.publicnode.com") if os.getenv("ARBITRUM_WS_URL") else ""
+_DRPC_WSS = os.getenv("DRPC_WSS_URL", "")
+_PUBLIC_WSS = os.getenv("RPC_WSS_URL", "wss://arbitrum-one.publicnode.com")
+_ALCHEMY_WSS = os.getenv("ARBITRUM_WS_URL", "")
+PRIMARY_WSS   = _DRPC_WSS or _ALCHEMY_WSS or _PUBLIC_WSS
+SECONDARY_WSS = _PUBLIC_WSS if PRIMARY_WSS != _PUBLIC_WSS else (_ALCHEMY_WSS if PRIMARY_WSS != _ALCHEMY_WSS else "")
 
 WALLET_ADDR  = os.getenv("BOT_ADDRESS", "0x1269800101780229B50919e1e27be62DC6279e9B")
 PRIVATE_KEY  = os.getenv("BOT_PRIVATE_KEY", "")
@@ -283,6 +287,14 @@ class LiquidationPipelineV3:
         )
         await self.wsteth_mgr.start()
         logger.info(f"  wstETH: {self.wsteth_mgr.status()}")
+
+        # ── LST depeg scanner (wstETH, observe-only, fast depegs only) ──
+        async def _get_eth_usd() -> float:
+            price = self.prices.get_price("0x82aF49447D8a07e3bd95BD0d56f35241523fBab1")
+            return (price / 1e8) if price else 1640.0
+
+        self.lst_depeg_scanner = LSTDepegScanner(self.rpc_read.w3, _get_eth_usd)
+        asyncio.create_task(self.lst_depeg_scanner.run())
 
         # ── Profit gate: rejects sub-$5 liquidations before blast_submit ──
         self.profit_gate = ProfitGate(
@@ -760,6 +772,7 @@ class LiquidationPipelineV3:
         await self.skip_tel.stop()
         await self.price_poller.stop()
         await self.wsteth_mgr.stop()
+        self.lst_depeg_scanner.stop()
         await self.quote_cache.stop()
         await self.ws.stop()
         if self.compound is not None:

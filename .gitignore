@@ -20,3 +20,7 @@ node_modules/
 .hermes/
 *.tar.gz
 *.age
+*.db
+*.db-shm
+*.db-wal
+.env.bak*

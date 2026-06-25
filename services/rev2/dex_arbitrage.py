@@ -61,16 +61,35 @@ DECIMALS = {
 # Balancer flash loan (0% fee — the key advantage)
 BALANCER_VAULT = "0xBA12222222228d8Ba445958a75a0704d566BF2C8"
 
-# Pairs to monitor for arbitrage
-# Each entry: (token_a, token_b, test_size_a)
-# test_size is the probe amount — actual size scales to available liquidity
+# Pairs to monitor for arbitrage.
+# Each entry: (token_a, token_b, probe_size_a, univ3_fee_tiers, use_camelot)
+#
+# The real exploitable spreads on Arbitrum are BETWEEN Uniswap V3 fee tiers
+# (e.g. 500 ↔ 3000), not Camelot↔UniV3 — confirmed by swap_monitor's live
+# data (hundreds of UniV3-500↔UniV3-3000 spreads vs ~0 Camelot↔UniV3).
+# So each fee tier is treated as a distinct venue, and Camelot is added only
+# for pairs where it has a real, non-garbage pool.
+#
+# A pair needs >= 2 venues to arb. univ3_fee_tiers MUST include 500 where it
+# exists — that is the deepest pool and the source of most spreads.
 MONITORED_PAIRS = [
-    (WETH, USDC, int(1e18)),        # 1 WETH probe
-    (ARB,  USDC, int(1000e18)),     # 1000 ARB probe
-    (WBTC, WETH, int(0.05e8)),      # 0.05 WBTC probe
-    # WETH/USDT removed — Camelot pool too thin, always shows -4%+ spread
-    # WBTC/USDC removed — no real Camelot pool, returns garbage quote (~$14 for $5250)
+    (WETH, USDC, int(1e18),     [500, 3000], True),   # UniV3 500↔3000 + Camelot
+    (WETH, USDT, int(1e18),     [500, 3000], False),  # Camelot pool too thin
+    (WBTC, WETH, int(0.05e8),   [500],       True),   # UniV3-500 ↔ Camelot
+    (WBTC, USDC, int(0.05e8),   [500, 3000], False),  # no real Camelot pool
+    (ARB,  USDC, int(1000e18),  [500, 3000], True),
+    (ARB,  WETH, int(1000e18),  [3000],      True),   # UniV3-3000 ↔ Camelot
 ]
+
+# Uni V3 fee tiers we are willing to quote for arbitrage (includes 500 —
+# the shared multi_dex_router.UNIV3_FEE_TIERS excludes it).
+ARB_UNIV3_FEE_TIERS = [500, 3000, 10000]
+
+# Reject any single-leg quote implying a cross-venue spread above this — a
+# "too good" quote is almost always a thin/garbage pool that will not fill at
+# size (the buy leg would revert on-chain, wasting gas). Real cross-venue
+# arbs between these pools are well under 2%.
+MAX_PLAUSIBLE_SPREAD_PCT = 5.0
 
 # Minimum profit threshold — must clear this after all costs
 MIN_PROFIT_USD = 5.0
@@ -149,6 +168,8 @@ class ArbitrageScanner:
         self._min_profit  = min_profit_usd
         self._scans       = 0
         self._opportunities_found = 0
+        self._raw_spreads_seen    = 0
+        self._raw_spreads_rejected = 0
 
     async def scan_once(self) -> Optional[ArbOpportunity]:
         """
@@ -157,8 +178,8 @@ class ArbitrageScanner:
         self._scans += 1
 
         tasks = [
-            self._check_pair(token_a, token_b, size)
-            for token_a, token_b, size in MONITORED_PAIRS
+            self._check_pair(token_a, token_b, size, univ3_fees, use_camelot)
+            for token_a, token_b, size, univ3_fees, use_camelot in MONITORED_PAIRS
         ]
         results = await asyncio.gather(*tasks, return_exceptions=True)
 
@@ -182,74 +203,119 @@ class ArbitrageScanner:
 
     async def _check_pair(
         self, token_a: str, token_b: str, amount_a: int,
+        univ3_fees: List[int], use_camelot: bool,
     ) -> Optional[ArbOpportunity]:
         """
-        Check both arbitrage directions for a pair.
+        Find the best two-venue round-trip arbitrage for a pair.
 
-        Direction 1: A → B on DEX1, B → A on DEX2 (round trip in A)
-        We want: end with more A than we started.
+        A "venue" is a single quotable pool: each Uni V3 fee tier is its own
+        venue, plus Camelot. The real exploitable spread is between venues
+        (most often UniV3-500 ↔ UniV3-3000), so they must be quoted separately
+        — collapsing them with max() over fee tiers (the old behaviour) hides
+        exactly the spread we trade.
+
+        Round trip:
+            1. Quote A→B on every venue → buy B where we get the most B (cheapest).
+            2. With that B amount, quote B→A on every OTHER venue → sell where we
+               get the most A back.
+            3. If A_back > A_in after gas + on-chain profit guard → opportunity.
+
+        Both legs are REAL QuoterV2 quotes (price-impact + fee included), so a
+        positive round trip here corresponds to an executable on-chain arb —
+        unlike a spot-price spread estimate, which ignores impact and reverts at
+        the sell leg's amountOutMinimum guard.
         """
-        # Quote A→B on both DEXs
-        # Then for the winning B amount, quote B→A on the OTHER dex
-        # If round trip yields more A than amount_a → arbitrage exists
-
-        # Get individual DEX quotes (not "best" — we need per-DEX)
-        camelot_ab = await self._quote_single_dex("camelot", token_a, token_b, amount_a)
-        univ3_ab   = await self._quote_single_dex("univ3",   token_a, token_b, amount_a)
-
-        if camelot_ab is None or univ3_ab is None:
+        # Build the venue set for this pair.
+        venues: List[tuple] = [("univ3", f) for f in univ3_fees]
+        if use_camelot:
+            venues.append(("camelot", 0))
+        if len(venues) < 2:
             return None
 
-        camelot_ab_out, _camelot_ab_fee = camelot_ab
-        univ3_ab_out,   univ3_ab_fee    = univ3_ab
-
-        # Direction 1: buy B on Camelot (more B out), sell B on Uni V3
-        # Direction 2: buy B on Uni V3, sell B on Camelot
-        # Pick whichever DEX gives more B for buying, sell on the other
-
-        opportunities = []
-
-        # Try: buy B where it's cheaper (more B per A), sell where it's pricier
-        if camelot_ab_out > univ3_ab_out:
-            # Camelot gives more B — buy there, sell B back to A on Uni V3
-            b_amount  = camelot_ab_out
-            buy_fee   = 0   # Camelot has no fee tier
-            sell_q    = await self._quote_single_dex("univ3", token_b, token_a, b_amount)
-            if sell_q:
-                a_back, sell_fee = sell_q
-                opportunities.append(("camelot", "univ3", b_amount, a_back, buy_fee, sell_fee))
-        else:
-            # Uni V3 gives more B — buy there, sell B back to A on Camelot
-            b_amount  = univ3_ab_out
-            buy_fee   = univ3_ab_fee
-            sell_q    = await self._quote_single_dex("camelot", token_b, token_a, b_amount)
-            if sell_q:
-                a_back, sell_fee = sell_q
-                opportunities.append(("univ3", "camelot", b_amount, a_back, buy_fee, sell_fee))
-
-        if not opportunities:
+        # ── Leg 1: A→B on every venue, concurrently ──────────────────────
+        ab = await asyncio.gather(
+            *[self._quote_venue(v, token_a, token_b, amount_a) for v in venues],
+            return_exceptions=True,
+        )
+        ab_valid = [(venues[i], r) for i, r in enumerate(ab)
+                    if isinstance(r, int) and r > 0]
+        if len(ab_valid) < 2:
             return None
 
-        buy_dex, sell_dex, b_amount, a_back, buy_fee, sell_fee = opportunities[0]
+        # Buy B where we receive the most B per A (the cheapest place to buy B).
+        buy_venue, b_amount = max(ab_valid, key=lambda x: x[1])
 
-        # Gross profit in token_a units
-        gross_profit = a_back - amount_a
-        if gross_profit <= 0:
+        # ── Leg 2: B→A on every OTHER venue, concurrently ────────────────
+        sell_venues = [v for v in venues if v != buy_venue]
+        ba = await asyncio.gather(
+            *[self._quote_venue(v, token_b, token_a, b_amount) for v in sell_venues],
+            return_exceptions=True,
+        )
+        ba_valid = [(sell_venues[i], r) for i, r in enumerate(ba)
+                    if isinstance(r, int) and r > 0]
+        if not ba_valid:
             return None
 
-        # Value the profit in USD
+        sell_venue, a_back = max(ba_valid, key=lambda x: x[1])
+
+        # Quoted gross profit (QuoterV2 ideal — what the scanner would claim
+        # but NOT what the on-chain tx actually delivers)
+        quoted_gross = a_back - amount_a
+        if quoted_gross <= 0:
+            return None
+
+        # Plausibility guard — a spread this large means a thin/garbage pool
+        # whose buy leg would revert on-chain; skip rather than burn gas.
+        if (quoted_gross / amount_a) * 100 > MAX_PLAUSIBLE_SPREAD_PCT:
+            logger.debug(
+                f"[Arb] implausible spread {(quoted_gross/amount_a)*100:.2f}% "
+                f"{token_a[:8]}→{token_b[:8]} buy={buy_venue} sell={sell_venue} — skip"
+            )
+            return None
+
+        buy_dex,  buy_fee  = buy_venue[0],  buy_venue[1]
+        sell_dex, sell_fee = sell_venue[0], sell_venue[1]
+
+        # Value the profit in USD (needed for gas cost and threshold check)
         a_price_usd = self._get_price_usd(token_a)
         if a_price_usd is None:
             return None
-        a_dec            = DECIMALS.get(token_a, 18)
-        gross_profit_usd = (gross_profit / 10**a_dec) * a_price_usd
+        a_dec = DECIMALS.get(token_a, 18)
 
-        # Gas cost
+        # ── Worst-case execution simulation ──────────────────────────
+        # Do NOT use the ideal QuoterV2 round-trip as the profit.
+        # Simulate both legs at the same slippage guards the on-chain tx
+        # uses (ArbExecutor._build_tx: 0.3% buy, 0.3% sell). Only treat
+        # as profitable if the worst-case outcome clears gas + threshold.
+        #
+        # Buy leg: pool moves 0.3% against us → buy_out_min is enforced
+        # Sell leg: with reduced B, pool moves another 0.3% against us
+        SLIPPAGE_BPS = 30
+        worst_buy = int(b_amount * (10_000 - SLIPPAGE_BPS) / 10_000)
+        worst_sell_rate = (a_back / b_amount) * (10_000 - SLIPPAGE_BPS) / 10_000
+        worst_a_back = int(worst_buy * worst_sell_rate)
+        worst_gross = worst_a_back - amount_a
+
+        if worst_gross <= 0:
+            self._raw_spreads_seen += 1
+            self._raw_spreads_rejected += 1
+            logger.debug(
+                f"[Arb] {token_a[:8]}→{token_b[:8]} spread={quoted_gross/amount_a*100:.3f}% "
+                f"but worst-case (2×0.3% slip) = {(worst_gross/amount_a)*100:.3f}% — unprofitable"
+            )
+            return None
+
+        gross_profit_usd = (worst_gross / 10**a_dec) * a_price_usd
         gas_cost_usd = self._estimate_gas_cost_usd()
-
-        # Net
         net_profit_usd = gross_profit_usd - gas_cost_usd
-        spread_pct     = (gross_profit / amount_a) * 100
+        spread_pct = (quoted_gross / amount_a) * 100
+
+        if net_profit_usd < self._min_profit:
+            self._raw_spreads_seen += 1
+            self._raw_spreads_rejected += 1
+            return None
+
+        self._raw_spreads_seen += 1
 
         return ArbOpportunity(
             token_in         = token_a,
@@ -260,7 +326,7 @@ class ArbitrageScanner:
             buy_router       = self._router_for(buy_dex),
             sell_router      = self._router_for(sell_dex),
             expected_out     = a_back,
-            gross_profit     = gross_profit,
+            gross_profit     = quoted_gross,
             gross_profit_usd = gross_profit_usd,
             gas_cost_usd     = gas_cost_usd,
             net_profit_usd   = net_profit_usd,
@@ -270,38 +336,27 @@ class ArbitrageScanner:
             sell_fee_tier    = sell_fee,
         )
 
-    async def _quote_single_dex(
-        self, dex: str, token_in: str, token_out: str, amount_in: int,
-    ) -> Optional[tuple]:
-        """Get a quote from one specific DEX. Returns (amount_out, fee_tier) or None."""
+    async def _quote_venue(
+        self, venue: tuple, token_in: str, token_out: str, amount_in: int,
+    ) -> Optional[int]:
+        """
+        Quote a single venue. venue = ("univ3", fee_tier) or ("camelot", 0).
+        Returns amount_out (int) or None. One venue = one pool — no max() over
+        tiers, so each fee tier stays distinguishable.
+        """
+        dex, fee = venue
         try:
+            tin  = AsyncWeb3.to_checksum_address(token_in)
+            tout = AsyncWeb3.to_checksum_address(token_out)
             if dex == "camelot":
-                result = await self._multi_dex._quote_camelot(
-                    AsyncWeb3.to_checksum_address(token_in),
-                    AsyncWeb3.to_checksum_address(token_out),
-                    amount_in,
-                )
-                if result is None:
-                    return None
-                return (result.amount_out, 0)
-            else:  # univ3 — try both fee tiers, take best
-                from multi_dex_router import UNIV3_FEE_TIERS
-                quotes = await asyncio.gather(*[
-                    self._multi_dex._quote_univ3(
-                        AsyncWeb3.to_checksum_address(token_in),
-                        AsyncWeb3.to_checksum_address(token_out),
-                        amount_in, fee,
-                    )
-                    for fee in UNIV3_FEE_TIERS
-                ], return_exceptions=True)
-                valid = [q for q in quotes
-                         if q is not None and not isinstance(q, Exception)]
-                if not valid:
-                    return None
-                result = max(valid, key=lambda q: q.amount_out)
-                return (result.amount_out, result.fee_tier)
+                result = await self._multi_dex._quote_camelot(tin, tout, amount_in)
+            else:
+                result = await self._multi_dex._quote_univ3(tin, tout, amount_in, fee)
+            if result is None or result.amount_out == 0:
+                return None
+            return result.amount_out
         except Exception as e:
-            logger.debug(f"[Arb] {dex} quote failed: {e}")
+            logger.debug(f"[Arb] {dex} fee={fee} quote failed: {e}")
             return None
 
     def _router_for(self, dex: str) -> str:
@@ -343,13 +398,17 @@ class ArbitrageScanner:
         return {
             "scans":               self._scans,
             "opportunities_found": self._opportunities_found,
+            "raw_spreads_seen":    self._raw_spreads_seen,
+            "raw_spreads_rejected": self._raw_spreads_rejected,
         }
 
     def log_stats(self) -> None:
         s = self.stats
         logger.info(
             f"[Arb] scans={s['scans']} "
-            f"opportunities={s['opportunities_found']}"
+            f"opportunities={s['opportunities_found']} "
+            f"raw_spreads={s['raw_spreads_seen']} "
+            f"rejected={s['raw_spreads_rejected']}"
         )
 
 

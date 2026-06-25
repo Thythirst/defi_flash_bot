@@ -33,7 +33,7 @@ logger = logging.getLogger(__name__)
 
 # Aave V3 LiquidationCall topic0 (keccak256 of event signature)
 LIQUIDATION_CALL_TOPIC = (
-    "0xe413a321e8681d831f4dbccbeca18f026983974cfbbe2f13b9ac78f0ef6a008"
+    "0xe413a321e8681d831f4dbccbca790d2952b56f977908e45be37335533e005286"
 )
 
 
