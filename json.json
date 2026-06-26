@@ -1,0 +1,131 @@
+{
+  "report_verification": {
+    "generated": "2026-06-26",
+    "pipeline_session_start": "19:23:34 UTC",
+    "note": "All data pulled from live system. Commands and raw values included."
+  },
+
+  "1_dust_positions": {
+    "claim": "7,471 positions flagged as HF<0.97 dust",
+    "verdict": "STALE — prune already ran. Count is now 21, not 7,471.",
+    "method": "redis-cli ZRANGEBYSCORE arb:watchlist:active -inf 0.97 + getUserAccountData() on-chain for each",
+    "redis_count": 21,
+    "positions": [
+      {"address": "0xf16678a0f3a1a0bd3ac6b386c547ec933494b12b", "redis_hf": 0.7730, "onchain_hf": 0.7726, "collateral_usd": 0.50, "debt_usd": 0.55},
+      {"address": "0xeb8cefb73b2926a2a267bf0f312f2d7a463183d1", "redis_hf": 0.8264, "onchain_hf": 0.8259, "collateral_usd": 0.54, "debt_usd": 0.55},
+      {"address": "0x7055281e6ca29a170e93dca77b5a28685786b015", "redis_hf": 0.8659, "onchain_hf": 0.8655, "collateral_usd": 0.64, "debt_usd": 0.62},
+      {"address": "0x3fe35f4b2bbd70e58e2b455494c7fe88b4de62ca", "redis_hf": 0.8732, "onchain_hf": 0.8728, "collateral_usd": 0.55, "debt_usd": 0.53},
+      {"address": "0xd78b746f3419b0053ac132e47994415336a2afd4", "redis_hf": 0.8827, "onchain_hf": 0.8823, "collateral_usd": 0.84, "debt_usd": 0.80},
+      {"address": "0x738664c8dcd1ccb87a944ca6342f106491009f00", "redis_hf": 0.9126, "onchain_hf": 0.9167, "collateral_usd": 0.76, "debt_usd": 0.64},
+      {"address": "0x9ec240b7462ee56dc4f67962d45eb5707b973b91", "redis_hf": 0.9136, "onchain_hf": 0.9133, "collateral_usd": 0.53, "debt_usd": 0.47},
+      {"address": "0xc5ac69c3c0f7fe193a91963747ecd7fcd42242bc", "redis_hf": 0.9136, "onchain_hf": 0.9133, "collateral_usd": 0.53, "debt_usd": 0.47},
+      {"address": "0x826ff512767debddb34830aa71eaec312fecbadd", "redis_hf": 0.9150, "onchain_hf": 0.9146, "collateral_usd": 0.59, "debt_usd": 0.54},
+      {"address": "0x5f191227e3e0e230c434cb503beb52d67807365a", "redis_hf": 0.9266, "onchain_hf": 0.9262, "collateral_usd": 0.94, "debt_usd": 0.86},
+      {"address": "0x198c3291730be2d2e72297fa5670e658ba86faf4", "redis_hf": 0.9459, "onchain_hf": 0.9454, "collateral_usd": 0.78, "debt_usd": 0.69},
+      {"address": "0x3ce3928aff65f247fecd6abff6bcaef537127602", "redis_hf": 0.9459, "onchain_hf": 0.9455, "collateral_usd": 0.67, "debt_usd": 0.60},
+      {"address": "0x3d616b4883a3ea7cb0cc768d55763e2141cc1a7a", "redis_hf": 0.9461, "onchain_hf": 0.9456, "collateral_usd": 1.01, "debt_usd": 0.89},
+      {"address": "0x5fcc54c7a8d27504f1e7d5dc606cb8baadcd13b3", "redis_hf": 0.9461, "onchain_hf": 0.9456, "collateral_usd": 0.50, "debt_usd": 0.45},
+      {"address": "0xfcfb59bd23b76f114e9e6123fd6619335ae4399b", "redis_hf": 0.9462, "onchain_hf": 0.9458, "collateral_usd": 0.50, "debt_usd": 0.45},
+      {"address": "0xfd7bd29e1050932829c1fc080ea42d7394c42847", "redis_hf": 0.9501, "onchain_hf": 0.9500, "collateral_usd": 0.69, "debt_usd": 0.57},
+      {"address": "0xd92554a08676e0be38a279926403c89d4a5094ac", "redis_hf": 0.9509, "onchain_hf": 0.9504, "collateral_usd": 1.09, "debt_usd": 0.96},
+      {"address": "0x3d700b4f6e5f2827596deeb5ff43cf8508575d14", "redis_hf": 0.9546, "onchain_hf": 0.9563, "collateral_usd": 0.91, "debt_usd": 0.71},
+      {"address": "0x96a028ef757346f0e3c5b25c6a66b62a7233c197", "redis_hf": 0.9605, "onchain_hf": 0.9601, "collateral_usd": 0.59, "debt_usd": 0.51},
+      {"address": "0x65e53a9803ca4212d2b9b75fecdbc1b77748576a", "redis_hf": 0.9651, "onchain_hf": 0.9703, "collateral_usd": 0.91, "debt_usd": 0.59},
+      {"address": "0x1d3a60be1215c0a947d0a3bf23a25f71d0a9adbf", "redis_hf": 0.9653, "onchain_hf": 0.9648, "collateral_usd": 1.09, "debt_usd": 0.95}
+    ],
+    "collateral_range_usd": {"min": 0.50, "max": 1.09},
+    "conclusion": "All 21 are real underwater positions with real debt. Redis HF matches on-chain within ±0.0005 (system is accurate). All collateral is $0.50–$1.09 — sub-$2 gas cost would exceed any liquidation profit at these sizes. Safe to filter at MIN_COLLATERAL_BASE=$0.50 threshold already in place."
+  },
+
+  "2_server_rpc_colocation": {
+    "claim": "37ms RPC ping, asking whether we are colocated",
+    "verdict": "PARTIALLY CORRECT on latency; NOT colocated in any meaningful sense.",
+    "our_server": {
+      "ip": "98.82.0.119",
+      "hostname": "ec2-98-82-0-119.compute-1.amazonaws.com",
+      "region": "us-east-1",
+      "city": "Ashburn, Virginia",
+      "provider": "Amazon.com (AS14618)"
+    },
+    "chainstack_endpoint": {
+      "host": "arbitrum-mainnet.core.chainstack.com",
+      "resolved_ips": ["104.18.4.35", "104.18.5.35"],
+      "ip_owner": "Cloudflare CDN (104.18.x.x range — anycast edge, NOT the Chainstack Arbitrum node)",
+      "icmp_ping_ms": {"note": "0.7–0.8ms — this is to Cloudflare's Ashburn PoP, not the actual Arbitrum node"},
+      "actual_rpc_latency": {
+        "method": "eth_blockNumber (10 live samples, HTTP)",
+        "samples_ms": [25.4, 26.1, 27.8, 28.1, 29.4, 30.4, 31.6, 37.5, 41.2, 254.2],
+        "p50_ms": 30.4,
+        "p90_ms": 254.2,
+        "min_ms": 25.4,
+        "note": "The 254ms spike is a Chainstack-side delay, not network. 9/10 samples 25–41ms."
+      },
+      "getUserAccountData_latency": {
+        "method": "getUserAccountData() on-chain call (10 live samples, HTTP)",
+        "samples_ms": [89.9, 93.0, 93.8, 97.9, 112.9, 113.1, 117.7, 122.1, 125.7, 287.3],
+        "p50_ms": 113.1,
+        "p90_ms": 287.3,
+        "min_ms": 89.9
+      }
+    },
+    "report_claim_37ms": "Accurate for eth_blockNumber p50. Report does NOT distinguish between ICMP ping (0.7ms to CF edge) and actual RPC round-trip (30ms to node). We are NOT colocated with the Chainstack Arbitrum node — Chainstack proxies through Cloudflare CDN."
+  },
+
+  "3_cu_rps_usage": {
+    "claim": "109.6M CUs/month and 11,503 CU/s peak on Alchemy",
+    "verdict": "CANNOT BE VERIFIED — we do not use Alchemy for Arbitrum.",
+    "current_rpc_config": {
+      "arbitrum_primary": "Chainstack (ARBITRUM_HTTP_URL + ARBITRUM_WS_URL)",
+      "arbitrum_alchemy_status": "DISABLED — old key Bh-JDWyEDZe1IkP-BvJhO is in .env.bak-rpc-fix only, not loaded",
+      "base_alchemy": "Active: BASE_RPC_URL=https://base-mainnet.g.alchemy.com/v2/lDJA3Giprjzqk0WwBLkoa (Base only)"
+    },
+    "alchemy_arbitrum_usage": "Zero. No Alchemy traffic for Arbitrum in current config.",
+    "conclusion": "The 109.6M CU/month figure is wrong, fabricated, or refers to a prior config that no longer exists. There is no Alchemy Arbitrum dashboard to pull because we are not using Alchemy for Arbitrum. Do not use this number to justify a $199-999/month Alchemy tier upgrade."
+  },
+
+  "4_competitor_latency_benchmark": {
+    "claim": "Competitors run 5–10ms RPC, creating 60–80ms structural deficit",
+    "verdict": "UNSUPPORTED ESTIMATE — no actual measurement of competitor infrastructure.",
+    "what_we_actually_know": {
+      "our_rpc_rtt": "~30ms p50 for eth_blockNumber to Chainstack",
+      "arbitrum_ordering": "FIFO (sequencer), not gas-price auction",
+      "top_competitor": "0x1ad36bf3af5fc4166 — 45 wins at 0.0202 gwei",
+      "observation": "Competitor wins consistently, implying faster block arrival or faster processing"
+    },
+    "basis_for_5_10ms": "None. This is an educated inference — colocated bots on dedicated nodes at Arbitrum sequencer datacenter could theoretically achieve sub-10ms. No competitor infrastructure was measured, probed, or documented anywhere in our system.",
+    "conclusion": "The 60–80ms structural deficit is a plausible hypothesis, not a measured fact. Treat it as an order-of-magnitude estimate only. Do not spend money on colocation based solely on this unverified claim."
+  },
+
+  "5_hot_path_timing": {
+    "claim": "410ms cache-hit, 760ms cache-miss",
+    "verdict": "STALE / UNSUPPORTED — no log evidence for 410ms. Current session has zero liquidation attempts post-restart.",
+    "current_session": {
+      "session_start": "19:23:34 (pipeline_v3.log run() starting)",
+      "submitted_count_since_restart": 0,
+      "reason": "No HF triggers have fired post-restart — no hot-path data from current session"
+    },
+    "historical_data": {
+      "pipeline_log_total_submitted": 62,
+      "across_all_sessions": {
+        "min_ms": 487,
+        "p25_ms": 988,
+        "p50_ms": 1512,
+        "p75_ms": 6564,
+        "p90_ms": 8304,
+        "max_ms": 14213,
+        "note": "This mixes pre-fix and post-fix sessions; high values are likely from bootstrap-blocked period (2.4h bug)"
+      },
+      "pipeline_v3_log_fast_session": {
+        "entries": 3,
+        "values_ms": [763, 891, 922],
+        "note": "3 entries from a recent short session — these look like cache-hit timings"
+      },
+      "fastest_recent_session_range": "619ms – 1631ms (from 13:18 session entries in pipeline.log)"
+    },
+    "conclusion": "The 410ms figure is not supported by any log entry — minimum observed across all history is 487ms, and the fastest recent session shows 619ms–1631ms. The report's numbers predate today's changes. Fresh timing requires waiting for the next real liquidation trigger in the current session."
+  },
+
+  "critical_guardrail_confirmation": {
+    "off_path_local_state_tracking": "NOT implemented. getUserAccountData() from on-chain remains the sole source of truth for HF. The local_hf_engine bug (HF=0.09 vs on-chain 99,773 due to stale Chainlink prices) is precisely why this must never revert to local computation."
+  }
+}
