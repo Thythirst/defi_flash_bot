@@ -1407,9 +1407,12 @@ class LiquidationPipelineV3:
                     f"(hot_path={submit_ms:.0f}ms)"
                 )
             else:
+                # None from _build_and_submit covers build failures, route failures,
+                # freshness aborts, AND submission failures — see prior log lines for
+                # the specific reason. blast_submit may not have been called at all.
                 self.skip_tel.record(SkipEvent(
-                    borrower=address, reason=SkipReason.SUBMIT_FAILED,
-                    hf=hf, detail="blast_submit returned None",
+                    borrower=address, reason=SkipReason.BUILD_FAILED,
+                    hf=hf, detail="_build_and_submit returned None (see log for specific cause)",
                     profit_usd=selection.expected_profit_usd,
                     collateral=selection.asset,
                 ))
@@ -1529,6 +1532,11 @@ class LiquidationPipelineV3:
             tx_data = self.flash_builder.rebuild_with_nonce(tx_data, nonce)
             if tx_data is None:
                 await self.nonce_mgr.rewind()
+                logger.error(f"[Submit] rebuild_with_nonce returned None for {borrower[:10]}… — nonce rewound")
+                self.skip_tel.record(SkipEvent(
+                    borrower=borrower, reason=SkipReason.BUILD_FAILED,
+                    detail="rebuild_with_nonce returned None (re-sign failed after cold build)",
+                ))
                 return None
 
             raw_tx = tx_data.raw_tx

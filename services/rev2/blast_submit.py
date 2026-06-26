@@ -253,10 +253,23 @@ async def blast_submit_ex(raw_tx: bytes) -> SubmitResult:
 async def blast_submit(raw_tx: bytes) -> Optional[str]:
     """
     Backward-compatible wrapper: returns the tx hash on success, else None.
-    Callers that need the accepted/ambiguous/failed distinction (for nonce
-    management) should call blast_submit_ex() directly.
+
+    WARNING: returns None for BOTH "ambiguous" (tx may be in-flight — hold nonce)
+    and "failed" (all endpoints rejected — nonce is free). Callers cannot manage
+    nonces correctly with this API. Use blast_submit_ex() instead.
     """
-    return (await blast_submit_ex(raw_tx)).tx_hash
+    result = await blast_submit_ex(raw_tx)
+    if result.status == "ambiguous":
+        logger.warning(
+            "[blast_submit] ambiguous result collapsed to None — "
+            "caller cannot distinguish from hard-fail; switch to blast_submit_ex()"
+        )
+    elif result.status == "failed":
+        logger.error(
+            "[blast_submit] hard-failed (all endpoints rejected) collapsed to None — "
+            "caller cannot distinguish from ambiguous; switch to blast_submit_ex()"
+        )
+    return result.tx_hash
 
 
 # ---------------------------------------------------------------------------
