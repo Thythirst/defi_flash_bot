@@ -54,22 +54,22 @@ class RPCProviderConfig:
         1RPC excluded — quota exhausted (403 on eth_call).
         Chainstack excluded — monthly quota exhausted (403).
         """
-        rpc_alchemy    = os.getenv("ARBITRUM_HTTP_URL") or os.getenv("ALCHEMY_HTTP_URL", "")
+        rpc_chainstack = os.getenv("ARBITRUM_HTTP_URL", "")
         rpc_drpc       = os.getenv("READ_RPC_PRIMARY",  "")   # DRPC lb — high rate limits
         rpc_publicnode = os.getenv("RPC_PUBLICNODE",    "https://arbitrum-one.publicnode.com")
         rpc_blastapi   = os.getenv("RPC_BLASTAPI",      "https://arbitrum-one.public.blastapi.io")
         rpc_public_arb = os.getenv("RPC_PUBLIC_ARB1",   "https://arb1.arbitrum.io/rpc")
 
-        alchemy   = Provider("Alchemy",   rpc_alchemy,    timeout=2.0) if rpc_alchemy else None
+        chainstack = Provider("Chainstack", rpc_chainstack, timeout=2.0) if rpc_chainstack else None
         drpc      = Provider("DRPC",      rpc_drpc,       timeout=5.0) if rpc_drpc else None
         publicnode= Provider("PublicNode", rpc_publicnode)
         blastapi  = Provider("BlastAPI",  rpc_blastapi)
         public_arb= Provider("PublicArb1", rpc_public_arb, timeout=5.0)
 
-        exec_list   = [p for p in [alchemy, drpc, blastapi, public_arb] if p]
-        read_list   = [p for p in [alchemy, blastapi, public_arb] if p]
-        light_list  = [p for p in [alchemy, publicnode, public_arb] if p]
-        submit_list = [p for p in [alchemy, drpc, blastapi, public_arb] if p]
+        exec_list   = [p for p in [chainstack, drpc, blastapi, public_arb] if p]
+        read_list   = [p for p in [chainstack, blastapi, public_arb] if p]
+        light_list  = [p for p in [chainstack, publicnode, public_arb] if p]
+        submit_list = [p for p in [chainstack, drpc, blastapi, public_arb] if p]
 
         return cls(
             exec_providers=exec_list,

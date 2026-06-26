@@ -113,13 +113,13 @@ logger = logging.getLogger("pipeline_v3")
 
 # ── Config (from .env) ────────────────────────────────────────
 # Centralised RPC provider selection with health-checked rotation.
-# Priority: DRPC (paid, stable) → PublicNode (free, high limits) → Alchemy
+# Priority: Chainstack (paid, WSS) → PublicNode (free, high limits) → DRPC (fallback)
 RPC_CONFIG = RPCProviderConfig.from_env()
-_DRPC_WSS = os.getenv("DRPC_WSS_URL", "")
+_CHAINSTACK_WSS = os.getenv("ARBITRUM_WS_URL", "")
 _PUBLIC_WSS = os.getenv("RPC_WSS_URL", "wss://arbitrum-one.publicnode.com")
-_ALCHEMY_WSS = os.getenv("ARBITRUM_WS_URL", "")
-PRIMARY_WSS   = _DRPC_WSS or _ALCHEMY_WSS or _PUBLIC_WSS
-SECONDARY_WSS = _PUBLIC_WSS if PRIMARY_WSS != _PUBLIC_WSS else (_ALCHEMY_WSS if PRIMARY_WSS != _ALCHEMY_WSS else "")
+_DRPC_WSS = os.getenv("DRPC_WSS_URL", "")
+PRIMARY_WSS   = _CHAINSTACK_WSS or _PUBLIC_WSS or _DRPC_WSS
+SECONDARY_WSS = _PUBLIC_WSS if PRIMARY_WSS != _PUBLIC_WSS else (_DRPC_WSS if _DRPC_WSS else "")
 
 WALLET_ADDR  = os.getenv("BOT_ADDRESS", "0x1269800101780229B50919e1e27be62DC6279e9B")
 PRIVATE_KEY  = os.getenv("BOT_PRIVATE_KEY", "")
