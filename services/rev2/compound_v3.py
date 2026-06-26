@@ -850,13 +850,18 @@ class CompoundV3Module:
             })
 
             signed  = self._sync_w3.eth.account.sign_transaction(tx_dict, self._pk)
-            from blast_submit import blast_submit
-            tx_hash = await blast_submit(signed.raw_transaction)
+            from blast_submit import blast_submit_ex
+            result = await blast_submit_ex(signed.raw_transaction)
 
-            if tx_hash:
+            if result.tx_hash:
                 logger.info(
                     f"[CompoundV3:{market_name}] Absorb-only submitted — "
-                    f"hash={tx_hash[:12]}… borrower={pos.address[:10]}…"
+                    f"hash={result.tx_hash[:12]}… borrower={pos.address[:10]}…"
+                )
+            elif result.status == "ambiguous":
+                logger.warning(
+                    f"[CompoundV3:{market_name}] Absorb-only ambiguous — "
+                    f"nonce held for {pos.address[:10]}…"
                 )
             else:
                 await self._nonce.rewind()
@@ -891,21 +896,29 @@ class CompoundV3Module:
             })
 
             signed  = self._sync_w3.eth.account.sign_transaction(tx_dict, self._pk)
-            from blast_submit import blast_submit
-            tx_hash = await blast_submit(signed.raw_transaction)
+            from blast_submit import blast_submit_ex
+            result = await blast_submit_ex(signed.raw_transaction)
 
-            if tx_hash:
+            if result.tx_hash:
                 logger.info(
                     f"[CompoundV3:{market_name}] Submitted — "
-                    f"hash={tx_hash[:12]}… "
+                    f"hash={result.tx_hash[:12]}… "
                     f"borrower={params.borrower[:10]}… "
                     f"collateral={params.collateral_asset[:10]}… "
                     f"est_profit=${params.estimated_profit:.2f}"
                 )
-            else:
-                await self._nonce.rewind()
+            elif result.status == "ambiguous":
+                # tx may be in-flight — hold the nonce
                 logger.warning(
-                    f"[CompoundV3:{market_name}] blast_submit returned None"
+                    f"[CompoundV3:{market_name}] Ambiguous submit for "
+                    f"{params.borrower[:10]}… — nonce held, not reused"
+                )
+            else:
+                # hard-failed: all endpoints rejected — nonce is free
+                await self._nonce.rewind()
+                logger.error(
+                    f"[CompoundV3:{market_name}] All endpoints rejected tx for "
+                    f"{params.borrower[:10]}… — rewinding nonce"
                 )
 
         except Exception as e:

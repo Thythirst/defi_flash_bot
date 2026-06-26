@@ -1060,7 +1060,7 @@ class AaveBaseModule:
         self._in_flight.add(pos.address)
         try:
             from collateral_selector import CollateralSelector
-            from blast_submit import blast_submit
+            from blast_submit import blast_submit_ex
 
             # Fetch reserve data if missing
             if not pos.reserves:
@@ -1109,14 +1109,25 @@ class AaveBaseModule:
                 await self._nonce_mgr.rewind()
                 return
 
-            tx_hash = await blast_submit(tx_data["raw_tx"])
-            if tx_hash:
+            result = await blast_submit_ex(tx_data["raw_tx"])
+            if result.tx_hash:
                 logger.info(
-                    f"[AaveBase] Submitted — hash={tx_hash[:12]}… "
+                    f"[AaveBase] Submitted — hash={result.tx_hash[:12]}… "
                     f"borrower={pos.address[:10]}… "
                     f"HF={pos.hf_float:.4f}"
                 )
+            elif result.status == "ambiguous":
+                # tx may be in-flight (timeout / already-known) — hold the nonce
+                logger.warning(
+                    f"[AaveBase] Ambiguous submit for {pos.address[:10]}… "
+                    f"— nonce held, not reused"
+                )
             else:
+                # hard-failed: all endpoints rejected — nonce is free
+                logger.error(
+                    f"[AaveBase] All endpoints rejected tx for {pos.address[:10]}… "
+                    f"— rewinding nonce"
+                )
                 await self._nonce_mgr.rewind()
 
         except Exception as e:
