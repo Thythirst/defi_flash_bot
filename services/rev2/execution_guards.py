@@ -70,8 +70,10 @@ class ConfirmationTracker:
         self._task: Optional[asyncio.Task] = None
         self._db = None   # set via set_db() after pipeline db is ready
         # P3: revert callback — called with borrower address when a tx reverts.
-        # Wire to pipeline._revert_cooldown for 30s re-submission blacklist.
-        self.on_revert: Optional[Callable[[str], None]] = None
+        self.on_revert:   Optional[Callable[[str], None]] = None
+        # Telegram alert callbacks — set by pipeline after tg_alerts import.
+        self.on_confirmed: Optional[Callable[[str, str, float, int], None]] = None  # (borrower, tx_hash, profit, block)
+        self.on_reverted:  Optional[Callable[[str, str, int], None]] = None         # (borrower, tx_hash, block)
 
     def set_db(self, db) -> None:
         """
@@ -175,6 +177,12 @@ class ConfirmationTracker:
                                     f"[ConfirmationTracker] DB confirm failed: {_e}"
                                 )
                         await self._clear(entry.borrower, "confirmed")
+                        if self.on_confirmed:
+                            try:
+                                self.on_confirmed(entry.borrower, entry.tx_hash,
+                                                  entry.estimated_profit, block)
+                            except Exception as _cb_e:
+                                logger.debug(f"[ConfirmationTracker] on_confirmed callback error: {_cb_e}")
                     else:
                         logger.warning(
                             f"[ConfirmationTracker] REVERTED {entry.tx_hash[:12]}… "
@@ -197,6 +205,11 @@ class ConfirmationTracker:
                                 self.on_revert(entry.borrower)
                             except Exception as _cb_e:
                                 logger.debug(f"[ConfirmationTracker] on_revert callback error: {_cb_e}")
+                        if self.on_reverted:
+                            try:
+                                self.on_reverted(entry.borrower, entry.tx_hash, block)
+                            except Exception as _cb_e:
+                                logger.debug(f"[ConfirmationTracker] on_reverted callback error: {_cb_e}")
 
                 except Exception as e:
                     logger.debug(f"[ConfirmationTracker] Receipt poll error: {e}")

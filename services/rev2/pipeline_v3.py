@@ -363,6 +363,34 @@ class LiquidationPipelineV3:
             logger.info(f"[Backoff] {borrower[:10]}… blacklisted 30s after tx revert")
         self.tracker.on_revert = _on_revert
 
+        # Telegram alert callbacks
+        try:
+            from tg_alerts import send as _tg_send
+
+            def _on_confirmed(borrower: str, tx_hash: str, profit: float, block: int) -> None:
+                msg = (
+                    f"✅ *Liquidation Confirmed*\n\n"
+                    f"Borrower: `{borrower[:16]}…`\n"
+                    f"Profit:   `${profit:.2f}`\n"
+                    f"Tx:       `{tx_hash[:20]}…`\n"
+                    f"Block:    `{block:,}`"
+                )
+                asyncio.ensure_future(_tg_send(msg))
+
+            def _on_reverted_tg(borrower: str, tx_hash: str, block: int) -> None:
+                msg = (
+                    f"❌ *Liquidation Reverted*\n\n"
+                    f"Borrower: `{borrower[:16]}…`\n"
+                    f"Tx:       `{tx_hash[:20]}…`\n"
+                    f"Block:    `{block:,}`"
+                )
+                asyncio.ensure_future(_tg_send(msg))
+
+            self.tracker.on_confirmed = _on_confirmed
+            self.tracker.on_reverted  = _on_reverted_tg
+        except ImportError:
+            pass
+
         # ── Skip telemetry ──────────────────────────────────
         self.skip_tel = SkipTelemetry(db_path="skips.db")
         await self.skip_tel.start()
@@ -581,6 +609,15 @@ class LiquidationPipelineV3:
         await self.setup()
         self._setup_complete = True
         logger.info("[Pipeline] setup() complete — starting main loop tasks")
+        try:
+            from tg_alerts import send as _tg_send
+            asyncio.ensure_future(_tg_send(
+                f"🚀 *Pipeline v3 Started*\n"
+                f"Wallet: `{WALLET_ADDR[:16]}…`\n"
+                f"Watching `{len(getattr(self, '_watchlist', []))}` addresses"
+            ))
+        except ImportError:
+            pass
 
         # Re-scan HF engine for positions that were underwater during setup
         # (suppressed by _setup_complete guard). These need immediate action.
