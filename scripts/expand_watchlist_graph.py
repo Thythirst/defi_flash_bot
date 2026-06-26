@@ -42,6 +42,10 @@ MAX_HF        = 3.0
 BATCH_SIZE    = 300   # addresses per Multicall3 call
 PAGE_SIZE     = 1000  # users per Graph query page
 
+# Minimum collateral to be worth monitoring (USD, 8-decimal Aave base currency).
+# Positions below this are zombie accounts left from prior liquidations — no profit possible.
+MIN_COLLATERAL_BASE = 50_000_000  # $0.50
+
 MULTICALL_ABI = [{"inputs":[{"components":[{"name":"target","type":"address"},
     {"name":"allowFailure","type":"bool"},{"name":"callData","type":"bytes"}],
     "name":"calls","type":"tuple[]"}],"name":"aggregate3","outputs":[{"components":[
@@ -122,15 +126,61 @@ async def verify_hf_batch(w3, addrs: list[str]) -> list[tuple[str, float]]:
                 ["uint256", "uint256", "uint256", "uint256", "uint256", "uint256"],
                 data
             )
+            col_base  = decoded[0]  # totalCollateralBase (USD, 8 decimals)
             debt_base = decoded[1]  # totalDebtBase (USD, 8 decimals)
             hf_raw    = decoded[5]  # healthFactor WAD
-            if debt_base == 0:
+            if debt_base == 0 or col_base < MIN_COLLATERAL_BASE:
                 continue
             hf = hf_raw / 1e18 if hf_raw < (2**96) else float("inf")
             out.append((addr, hf))
         except Exception:
             continue
     return out
+
+
+async def prune_dust(w3, r) -> int:
+    """
+    Re-verify all existing Redis entries and remove zombie positions.
+    A zombie is any position where totalCollateralBase < MIN_COLLATERAL_BASE
+    or totalDebtBase == 0 — these are exhausted accounts left from prior
+    liquidations that will never generate profit.
+    Returns the number of entries removed.
+    """
+    all_addrs = r.zrange(REDIS_KEY, 0, -1)
+    if not all_addrs:
+        return 0
+
+    log.info(f"Pruning dust from {len(all_addrs):,} existing watchlist entries...")
+
+    sem = asyncio.Semaphore(5)
+
+    async def _check_batch(batch):
+        async with sem:
+            return await verify_hf_batch(w3, batch)
+
+    batches = [all_addrs[i:i + BATCH_SIZE] for i in range(0, len(all_addrs), BATCH_SIZE)]
+    tasks = [asyncio.create_task(_check_batch(b)) for b in batches]
+
+    # Build set of addresses that pass the collateral filter
+    survivors: set[str] = set()
+    for fut in asyncio.as_completed(tasks):
+        results = await fut
+        for addr, _ in results:
+            survivors.add(addr.lower())
+
+    # Remove entries that didn't survive (dust / zero-debt)
+    to_remove = [a for a in all_addrs if a.lower() not in survivors]
+    if to_remove:
+        pipe = r.pipeline()
+        for addr in to_remove:
+            pipe.zrem(REDIS_KEY, addr)
+        pipe.execute()
+        log.info(f"Pruned {len(to_remove):,} dust/zombie positions "
+                 f"(col < ${MIN_COLLATERAL_BASE / 1e8:.2f} or zero debt)")
+    else:
+        log.info("No dust positions found — watchlist is clean")
+
+    return len(to_remove)
 
 
 async def main() -> None:
@@ -149,6 +199,10 @@ async def main() -> None:
         or ARBITRUM_HTTP
     )
     w3 = AsyncWeb3(AsyncHTTPProvider(READ_RPC_FOR_EXPAND))
+
+    # Remove dust/zombie positions from the existing watchlist before expanding.
+    pruned = await prune_dust(w3, r)
+    before_expand = r.zcard(REDIS_KEY)  # post-prune baseline for the final summary
 
     async with aiohttp.ClientSession() as session:
         borrowers = await fetch_all_borrowers(session)
@@ -198,10 +252,10 @@ async def main() -> None:
 
     total_now = r.zcard(REDIS_KEY)
     log.info(
-        f"\nDone. Added {added} new addresses. "
-        f"Watchlist: {len(existing)} → {total_now} (+{total_now - len(existing)})"
+        f"\nDone. Pruned {pruned:,} dust. Added {added} new addresses. "
+        f"Watchlist: {len(existing):,} → {before_expand:,} (post-prune) → {total_now:,}"
     )
-    log.info(f"Skipped: {skipped_healed} healed (HF>{MAX_HF}), {skipped_zero} zero-debt")
+    log.info(f"Skipped: {skipped_healed} healed (HF>{MAX_HF}), {skipped_zero} zero-debt or dust")
 
 
 if __name__ == "__main__":
