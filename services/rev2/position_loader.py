@@ -310,11 +310,14 @@ class PositionLoader:
         logger.debug(f"[PositionLoader] Refreshing {len(hot)} hot positions (HF < {hf_threshold})")
         refreshed = await self._batch_account_data(hot)
 
-        # Per-asset breakdown for ALL hot positions (not just HF < 1.05).
-        # This populates LocalHFEngine so price-move callbacks work correctly
-        # for positions approaching threshold, not just those already below 1.05.
-        if hot:
-            await self._batch_reserve_data(hot)
+        # Per-asset breakdown only for truly critical positions (HF < 1.02).
+        # Capped at 50 to stay within ~25s at 0.5s/address regardless of watchlist size.
+        critical = sorted(
+            [a for a, pos in self._positions.items() if pos.hf_float < 1.02],
+            key=lambda a: self._positions[a].hf_float
+        )[:50]
+        if critical:
+            await self._batch_reserve_data(critical)
 
         return refreshed
 
