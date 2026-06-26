@@ -234,6 +234,10 @@ ERC20_ABI = [{
 
 # ── Liquidation Pipeline (Rev3) ───────────────────────────────
 
+AAVE_POOL_GUAD_SEL = bytes.fromhex("bf92857c")  # getUserAccountData(address) — WAD HF in slot 5
+FRESHNESS_WAD = 1_000_000_000_000_000_000     # 1e18 — HF == 1.0 in Aave WAD encoding
+
+
 class LiquidationPipelineV3:
     def __init__(self):
         self._in_flight: set = set()
@@ -241,6 +245,7 @@ class LiquidationPipelineV3:
         self.wallet_balances: Dict[str, int] = {}
         self._batch_queue: list = []          # pending liquidations to batch per block
         self._batch_timer: Optional[asyncio.Task] = None  # fires after 50ms window
+        self._revert_cooldown: Dict[str, float] = {}      # borrower → monotonic expiry
 
     async def setup(self):
         """Initialize all subsystems. Called once at startup."""
@@ -347,6 +352,12 @@ class LiquidationPipelineV3:
         self.db = OutcomeDB()
         self.db.init()
         self.tracker.set_db(self.db)
+
+        # P3: Wire revert callback — blacklists the borrower for 30s
+        def _on_revert(borrower: str) -> None:
+            self._revert_cooldown[borrower] = time.monotonic() + 30.0
+            logger.info(f"[Backoff] {borrower[:10]}… blacklisted 30s after tx revert")
+        self.tracker.on_revert = _on_revert
 
         # ── Skip telemetry ──────────────────────────────────
         self.skip_tel = SkipTelemetry(db_path="skips.db")
@@ -706,6 +717,42 @@ class LiquidationPipelineV3:
             logger.debug(f"[Prewarm] build failed {borrower[:10]}: {e}")
             return (False, 0.0)
 
+    # ── P1: Freshness check — re-verify HF from chain ────────
+
+    async def _verify_hf_fresh(self, borrowers: list[str]) -> list[str]:
+        """
+        Re-query getUserAccountData from Aave pool for each borrower.
+        Returns only those still liquidatable (HF < 1.0 in WAD).
+        Uses rpc_read to avoid burning exec RPC rate limits.
+        Conservative: treats a failed call as still-liquidatable.
+        """
+        from eth_abi import decode as abi_decode
+
+        async def _check_one(addr: str) -> tuple[str, bool]:
+            try:
+                calldata = AAVE_POOL_GUAD_SEL + bytes.fromhex(addr[2:].lower().zfill(64))
+                result = await self.rpc_read.w3.eth.call(
+                    {"to": AAVE_POOL, "data": calldata}
+                )
+                hf = abi_decode(
+                    ["uint256","uint256","uint256","uint256","uint256","uint256"],
+                    result,
+                )[5]
+                return addr, hf < FRESHNESS_WAD
+            except Exception as e:
+                logger.warning(f"[Freshness] getUserAccountData error {addr[:10]}: {e}")
+                return addr, True  # conservative: assume still liquidatable
+
+        results = await asyncio.gather(*[_check_one(b) for b in borrowers])
+        live    = [addr for addr, ok in results if ok]
+        dropped = [addr for addr, ok in results if not ok]
+        if dropped:
+            logger.info(
+                f"[Freshness] Dropped {len(dropped)} no-longer-liquidatable: "
+                + ", ".join(d[:10] + "…" for d in dropped)
+            )
+        return live
+
     # ── Helper: select best debt asset ───────────────────────
 
     def _select_best_debt_asset(self, account_data) -> Optional[str]:
@@ -824,15 +871,14 @@ class LiquidationPipelineV3:
         if event is None:
             return
         if event.is_competitor:
-            self.db.record_lost_race(
-                event.borrower, event.liquidator,
-                event.tx_hash, event.block_number,
-                competitor_gas_price=event.gas_price,
-            )
+            # Immediate log — full telemetry filled in by background receipt fetch
             logger.warning(
                 f"[Pipeline] LOST RACE: borrower={event.borrower[:10]}… "
-                f"liquidator={event.liquidator[:10]}… block={event.block_number}"
+                f"liquidator={event.liquidator[:10]}… "
+                f"block={event.block_number} tx={event.tx_hash[:16]}…"
             )
+            # P4: Spawn receipt fetch to capture gas price + block timestamp
+            asyncio.create_task(self._record_competitor_loss(event), name="comp_telemetry")
         else:
             logger.info(
                 f"[Pipeline] OUR LIQUIDATION: borrower={event.borrower[:10]}… "
@@ -843,6 +889,43 @@ class LiquidationPipelineV3:
         self._presigned_cache.pop(event.borrower, None)
         self._presigned_snapshots.pop(event.borrower, None)
 
+    async def _record_competitor_loss(self, event) -> None:
+        """
+        Fetch tx receipt for a competitor win to get effectiveGasPrice + block timestamp.
+        Logs the data gap (block time vs our submission) and writes to OutcomeDB.
+        """
+        gas_price  = event.gas_price  # likely 0 from log subscription
+        block_ts   = None
+
+        try:
+            receipt = await self.rpc_read.w3.eth.get_transaction_receipt(event.tx_hash)
+            if receipt:
+                gp = receipt.get("effectiveGasPrice", 0)
+                gas_price = int(gp, 16) if isinstance(gp, str) else int(gp)
+        except Exception as e:
+            logger.debug(f"[Telemetry] Receipt fetch failed {event.tx_hash[:12]}: {e}")
+
+        try:
+            block = await self.rpc_read.w3.eth.get_block(event.block_number)
+            block_ts = int(block.get("timestamp", 0))
+        except Exception as e:
+            logger.debug(f"[Telemetry] Block fetch failed {event.block_number}: {e}")
+
+        self.db.record_lost_race(
+            event.borrower, event.liquidator,
+            event.tx_hash, event.block_number,
+            competitor_gas_price=gas_price,
+        )
+
+        gas_gwei = gas_price / 1e9 if gas_price else 0.0
+        ts_str   = f"block_ts={block_ts}" if block_ts else "block_ts=unknown"
+        logger.warning(
+            f"[Competitor] {event.liquidator} won — "
+            f"tx={event.tx_hash} "
+            f"block={event.block_number} {ts_str} "
+            f"gas={gas_gwei:.4f}gwei"
+        )
+
     # ── HF Engine → liquidation trigger ─────────────────────
 
     def _on_liquidatable(self, address: str, hf: float, pos):
@@ -852,6 +935,14 @@ class LiquidationPipelineV3:
             return
         if address in self._in_flight:
             return
+
+        # P3: Revert backoff — skip borrowers that just had a doomed tx
+        cooldown_until = self._revert_cooldown.get(address)
+        if cooldown_until is not None:
+            if time.monotonic() < cooldown_until:
+                logger.debug(f"[Backoff] {address[:10]}… still in 30s revert cooldown — skipping")
+                return
+            self._revert_cooldown.pop(address, None)
 
         old_hf = self._last_hf.get(address, 2.0)
         self._last_hf[address] = hf
@@ -912,16 +1003,35 @@ class LiquidationPipelineV3:
 
                 debt_price_raw = prices_snap.get(best_debt, 0)
                 debt_dec       = DECIMALS.get(best_debt, 18)
+                bonus_mult     = selection.liquidation_bonus_bps / 10_000
+                col_asset      = selection.asset
+                col_price_raw  = prices_snap.get(col_asset, 0)
+                col_dec        = DECIMALS.get(col_asset, 18)
+
                 if debt_price_raw > 0:
-                    dtc_usd       = account_data.total_debt_base / 1e8 * selection.close_factor
+                    dtc_usd = account_data.total_debt_base / 1e8 * selection.close_factor
+
+                    # P2: Cap dtc_usd by available collateral so builder and gate
+                    # use the same profit formula.  Without this cap:
+                    #   selector profit = min(dtc, col_usd) * bonus_pct  (capped)
+                    #   builder profit  = dtc * bonus_pct                 (uncapped)
+                    # They diverge by 10-50× when dtc >> col_usd, causing the $100k
+                    # gate to pass batches the builder values at $462k+.
+                    # The on-chain tx would also revert (borrower lacks the collateral).
+                    if col_price_raw > 0 and bonus_mult > 0:
+                        col_balance = next(
+                            (r.a_token_balance for r in account_data.reserves
+                             if r.asset.lower() == col_asset.lower()),
+                            0,
+                        )
+                        collateral_usd = (col_balance / 10 ** col_dec) * (col_price_raw / 1e8)
+                        dtc_usd = min(dtc_usd, collateral_usd / bonus_mult)
+
                     debt_to_cover = int(dtc_usd / (debt_price_raw / 1e8) * (10 ** debt_dec))
                 else:
+                    dtc_usd       = 0.0
                     debt_to_cover = selection.debt_to_cover
 
-                bonus_mult    = selection.liquidation_bonus_bps / 10_000
-                col_asset     = selection.asset
-                col_price_raw = prices_snap.get(col_asset, 0)
-                col_dec       = DECIMALS.get(col_asset, 18)
                 if col_price_raw > 0 and debt_price_raw > 0 and col_asset.lower() != best_debt.lower():
                     collateral_amount = int(
                         debt_to_cover * debt_price_raw * (10 ** col_dec) * bonus_mult
@@ -929,6 +1039,11 @@ class LiquidationPipelineV3:
                     )
                 else:
                     collateral_amount = int(debt_to_cover * bonus_mult)
+
+                # P2: Use builder formula for profit (col_usd - dbt_usd) so the
+                # $100k implausibility gate in _execute_batch sees the same value
+                # build_batch will compute, not the selector's capped estimate.
+                builder_profit_usd = dtc_usd * (bonus_mult - 1.0) if dtc_usd > 0 else 0.0
 
                 resolved.append({
                     'address':          address,
@@ -940,7 +1055,7 @@ class LiquidationPipelineV3:
                     'collateral_amount':collateral_amount,
                     'asset_prices_usd': prices_snap,  # raw (×1e8) — build_batch normalises
                     'asset_decimals':   DECIMALS,
-                    'profit_usd':       selection.expected_profit_usd,
+                    'profit_usd':       builder_profit_usd,
                     'account_data':     account_data,
                     'selection':        selection,
                 })
@@ -983,6 +1098,23 @@ class LiquidationPipelineV3:
         t0 = time.monotonic()
 
         try:
+            # ── P1: Re-verify HF from chain before spending gas ──────────
+            live_addrs = set(await self._verify_hf_fresh([r['address'] for r in group]))
+            if len(live_addrs) < len(group):
+                for r in group:
+                    if r['address'] not in live_addrs:
+                        self._in_flight.discard(r['address'])
+                group = [r for r in group if r['address'] in live_addrs]
+                total_profit_usd = sum(r['profit_usd'] for r in group)
+            if len(group) < 2:
+                # Survivors fall through to single path
+                for r in group:
+                    self._in_flight.discard(r['address'])
+                    asyncio.create_task(
+                        self._execute_liquidation(r['address'], r['hf'], r['pos'])
+                    )
+                return
+
             if not self.profit_gate.check(total_profit_usd):
                 logger.info(
                     f"[Batch] Aggregate profit ${total_profit_usd:.2f} below floor "
@@ -1315,6 +1447,17 @@ class LiquidationPipelineV3:
                 debt_asset       = best_debt_asset,
             )
 
+        # ── P1: Freshness check — re-verify from chain before gas spend ──
+        live = await self._verify_hf_fresh([borrower])
+        if not live:
+            logger.info(f"[Freshness] {borrower[:10]}… HF>=1.0 at submit time — aborting")
+            await self.nonce_mgr.rewind()
+            self.skip_tel.record(SkipEvent(
+                borrower=borrower, reason=SkipReason.BUILD_FAILED,
+                detail="freshness: HF >= 1.0 verified on-chain at submit time",
+            ))
+            return None
+
         # ── Submit ─────────────────────────────────────────────────────
         result  = await blast_submit_ex(raw_tx)
         tx_hash = result.tx_hash
@@ -1590,7 +1733,19 @@ class LiquidationPipelineV3:
                 if competitors:
                     logger.info("[Stats] Top competitors:")
                     for c in competitors:
-                        logger.info(f"  {c['address'][:10]} wins={c['wins']}")
+                        avg_gwei = (c.get('avg_gas_price') or 0) / 1e9
+                        import datetime
+                        last_seen_str = (
+                            datetime.datetime.utcfromtimestamp(c['last_seen']).strftime('%H:%M:%SZ')
+                            if c.get('last_seen') else "?"
+                        )
+                        logger.info(
+                            f"  {c['address']} wins={c['wins']} "
+                            f"avg_gas={avg_gwei:.4f}gwei "
+                            f"last_seen={last_seen_str}"
+                        )
+                else:
+                    logger.info("[Stats] Top competitors: (none recorded yet)")
             except Exception as e:
                 logger.error(f"[Stats] error: {e}")
 

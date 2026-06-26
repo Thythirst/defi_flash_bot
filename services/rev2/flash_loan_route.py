@@ -203,6 +203,10 @@ QUOTER_V2_ABI = [
 
 QUOTER_V2_ADDR = "0x61fFE014bA17989E743c5F6cB21bF9697530B21e"
 
+# P5: Per-asset slippage constants
+_MIN_PROFIT_MARGIN_PCT = 0.005   # 0.5% min net profit after swap cost
+_ABSOLUTE_MAX_SLIPPAGE = 0.10    # 10% hard ceiling — above this the oracle quote is corrupt
+
 
 # ---------------------------------------------------------------------------
 # Data classes
@@ -570,7 +574,8 @@ class RouteValidator:
         collateral_asset: str,
         debt_asset: str,
         swap_route: SwapRoute,
-        max_slippage_pct: float = 0.02,  # 2% max slippage
+        max_slippage_pct: float = 0.02,   # fallback only — overridden by bonus below
+        liquidation_bonus_bps: int = 0,   # per-reserve bonus; 0 → use max_slippage_pct
     ) -> tuple[bool, str]:
         """
         Pre-submission validation.
@@ -599,11 +604,27 @@ class RouteValidator:
         if not self._approved[swap_router_key]:
             return False, f"router {swap_router[:10]}… not approved in executor"
 
+        # P5: Per-asset slippage cap = min(bonus_pct - min_profit_margin, ABSOLUTE_MAX).
+        # The 2% global cap blocks wstETH (7% bonus, ~5.56% real swap cost = 1.44% net).
+        # For wstETH: min(0.07 - 0.005, 0.10) = 6.5% — allows the liquidation through.
+        # For WETH  : min(0.05 - 0.005, 0.10) = 4.5%   For USDC: same = 4.5%.
+        # This is consistent with the oracle-normalised slippage already computed in
+        # FlashLoanTxBuilder.build (lines ~794-816) — both use the same slippage_pct field.
+        if liquidation_bonus_bps > 0:
+            bonus_pct             = liquidation_bonus_bps / 10_000 - 1.0
+            effective_max_slippage = min(
+                max(bonus_pct - _MIN_PROFIT_MARGIN_PCT, 0.0),
+                _ABSOLUTE_MAX_SLIPPAGE,
+            )
+        else:
+            effective_max_slippage = max_slippage_pct
+
         # Check slippage acceptable
-        if swap_route.slippage_pct > max_slippage_pct:
+        if swap_route.slippage_pct > effective_max_slippage:
             return False, (
                 f"slippage {swap_route.slippage_pct:.2%} > "
-                f"max {max_slippage_pct:.2%}"
+                f"per-asset max {effective_max_slippage:.2%} "
+                f"(bonus={liquidation_bonus_bps}bps, margin={_MIN_PROFIT_MARGIN_PCT:.1%})"
             )
 
         # Check swap produces enough to cover flash loan
@@ -822,10 +843,11 @@ class FlashLoanTxBuilder:
         # Validate before building (skip for same-asset — no router needed)
         if swap_route.router != "0x0000000000000000000000000000000000000000":
             ok, reason = await self._validator.validate(
-                swap_router      = swap_route.router,
-                collateral_asset = collateral_asset,
-                debt_asset       = debt_asset,
-                swap_route       = swap_route,
+                swap_router           = swap_route.router,
+                collateral_asset      = collateral_asset,
+                debt_asset            = debt_asset,
+                swap_route            = swap_route,
+                liquidation_bonus_bps = liquidation_bonus_bps,  # P5: per-asset cap
             )
             if not ok:
                 logger.warning(f"[FlashLoanBuilder] Validation failed: {reason}")

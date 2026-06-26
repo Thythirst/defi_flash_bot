@@ -217,7 +217,7 @@ class OutcomeDB:
     def top_competitors(self, limit: int = 10) -> List[dict]:
         with self._get_conn() as conn:
             rows = conn.execute(
-                "SELECT address, wins, first_seen, last_seen FROM competitors "
+                "SELECT address, wins, first_seen, last_seen, avg_gas_price FROM competitors "
                 "ORDER BY wins DESC LIMIT ?", (limit,)
             ).fetchall()
         return [dict(r) for r in rows]

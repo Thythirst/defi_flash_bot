@@ -69,6 +69,9 @@ class ConfirmationTracker:
         self._running = False
         self._task: Optional[asyncio.Task] = None
         self._db = None   # set via set_db() after pipeline db is ready
+        # P3: revert callback — called with borrower address when a tx reverts.
+        # Wire to pipeline._revert_cooldown for 30s re-submission blacklist.
+        self.on_revert: Optional[Callable[[str], None]] = None
 
     def set_db(self, db) -> None:
         """
@@ -188,6 +191,12 @@ class ConfirmationTracker:
                                     f"[ConfirmationTracker] DB revert failed: {_e}"
                                 )
                         await self._clear(entry.borrower, "reverted")
+                        # P3: notify pipeline to blacklist this borrower for 30s
+                        if self.on_revert:
+                            try:
+                                self.on_revert(entry.borrower)
+                            except Exception as _cb_e:
+                                logger.debug(f"[ConfirmationTracker] on_revert callback error: {_cb_e}")
 
                 except Exception as e:
                     logger.debug(f"[ConfirmationTracker] Receipt poll error: {e}")
