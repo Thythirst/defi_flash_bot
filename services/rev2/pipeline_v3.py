@@ -634,8 +634,9 @@ class LiquidationPipelineV3:
         logger.info(f"[Pipeline] Post-setup scan starting — {n_prices} prices available")
 
         # Use AccountData.health_factor (authoritative on-chain value) not compute_hf()
+        # Guard: hf_float >= 0.97 → skip (HF_SUBMIT_WAD rejects these anyway; no point triggering)
         for addr, acc in list(self.loader._positions.items()):
-            if acc.is_liquidatable:
+            if acc.is_liquidatable and acc.hf_float < 0.97:
                 hf = acc.hf_float
                 logger.info(f"[Pipeline] Post-setup: {addr[:10]}… HF={hf:.4f} [on-chain] — triggering")
                 self._on_liquidatable(addr, hf, None)
@@ -960,7 +961,8 @@ class LiquidationPipelineV3:
         getUserAccountData().
         """
         for addr, acc in list(self.loader._positions.items()):
-            if acc.is_liquidatable and addr not in self._in_flight:
+            # Guard: hf_float >= 0.97 → skip (HF_SUBMIT_WAD rejects these at verify anyway)
+            if acc.is_liquidatable and acc.hf_float < 0.97 and addr not in self._in_flight:
                 self._on_liquidatable(addr, acc.hf_float, None)
 
     # ── Liquidation log handler (W3) ────────────────────────
