@@ -235,7 +235,11 @@ ERC20_ABI = [{
 # ── Liquidation Pipeline (Rev3) ───────────────────────────────
 
 AAVE_POOL_GUAD_SEL = bytes.fromhex("bf92857c")  # getUserAccountData(address) — WAD HF in slot 5
-FRESHNESS_WAD = 1_000_000_000_000_000_000     # 1e18 — HF == 1.0 in Aave WAD encoding
+FRESHNESS_WAD  = 1_000_000_000_000_000_000    # 1e18 — HF == 1.0 in Aave WAD encoding
+# Only fire when on-chain HF is at least 3% below 1.0 — positions at 0.97-1.0 are too
+# borderline: the price window between P1 check and tx landing is enough to flip them
+# back above 1.0, causing liquidationCall to revert (confirmed cause of all 57 prior reverts).
+HF_SUBMIT_WAD  = 970_000_000_000_000_000     # 0.97e18 — must be below this to submit
 
 
 class LiquidationPipelineV3:
@@ -728,7 +732,8 @@ class LiquidationPipelineV3:
         """
         from eth_abi import decode as abi_decode
 
-        async def _check_one(addr: str) -> tuple[str, bool]:
+        async def _check_one(addr: str) -> tuple[str, int]:
+            """Returns (addr, hf_wad). hf_wad=FRESHNESS_WAD+1 on error (conservative pass)."""
             try:
                 calldata = AAVE_POOL_GUAD_SEL + bytes.fromhex(addr[2:].lower().zfill(64))
                 result = await self.rpc_read.w3.eth.call(
@@ -738,18 +743,24 @@ class LiquidationPipelineV3:
                     ["uint256","uint256","uint256","uint256","uint256","uint256"],
                     result,
                 )[5]
-                return addr, hf < FRESHNESS_WAD
+                return addr, hf
             except Exception as e:
                 logger.warning(f"[Freshness] getUserAccountData error {addr[:10]}: {e}")
-                return addr, True  # conservative: assume still liquidatable
+                return addr, 0  # conservative: treat as HF=0 (clearly liquidatable)
 
-        results = await asyncio.gather(*[_check_one(b) for b in borrowers])
-        live    = [addr for addr, ok in results if ok]
-        dropped = [addr for addr, ok in results if not ok]
-        if dropped:
+        results  = await asyncio.gather(*[_check_one(b) for b in borrowers])
+        live      = [addr for addr, hf in results if hf < HF_SUBMIT_WAD]
+        borderline = [addr for addr, hf in results if HF_SUBMIT_WAD <= hf < FRESHNESS_WAD]
+        healed    = [addr for addr, hf in results if hf >= FRESHNESS_WAD]
+        if borderline:
             logger.info(
-                f"[Freshness] Dropped {len(dropped)} no-longer-liquidatable: "
-                + ", ".join(d[:10] + "…" for d in dropped)
+                f"[Freshness] Skipping {len(borderline)} borderline (0.97<HF<1.0 — revert risk): "
+                + ", ".join(d[:10] + "…" for d in borderline)
+            )
+        if healed:
+            logger.info(
+                f"[Freshness] Dropped {len(healed)} healed (HF>=1.0): "
+                + ", ".join(d[:10] + "…" for d in healed)
             )
         return live
 
