@@ -530,8 +530,11 @@ class LiquidationPipelineV3:
             logger.warning("  ARB_EXECUTOR_ADDR not set — DEX arb disabled")
 
         # ── HF Engine ───────────────────────────────────────
+        # compute_hf() is a fast candidate detector only — NOT the trigger.
+        # _hf_engine_price_trigger re-fetches AccountData.health_factor from chain
+        # via getUserAccountData() before firing _on_liquidatable.
         self.hf_engine = LocalHFEngine(
-            on_liquidatable=self._on_liquidatable,
+            on_liquidatable=self._hf_engine_price_trigger,
             decimals=DECIMALS,
         )
         self.hf_engine.prices = self.prices  # W9: replace raw dict with PriceRegistry
@@ -630,13 +633,12 @@ class LiquidationPipelineV3:
         n_prices = len(self.prices.snapshot())
         logger.info(f"[Pipeline] Post-setup scan starting — {n_prices} prices available")
 
-        for addr, pos in list(self.hf_engine.positions.items()):
-            total_debt = sum(pos.debt.values())
-            if total_debt > 0:
-                hf = self.hf_engine.compute_hf(pos)
-                if hf < 1.0:
-                    logger.info(f"[Pipeline] Post-setup: {addr[:10]}… HF={hf:.4f} — triggering")
-                    self._on_liquidatable(addr, hf, pos)
+        # Use AccountData.health_factor (authoritative on-chain value) not compute_hf()
+        for addr, acc in list(self.loader._positions.items()):
+            if acc.is_liquidatable:
+                hf = acc.hf_float
+                logger.info(f"[Pipeline] Post-setup: {addr[:10]}… HF={hf:.4f} [on-chain] — triggering")
+                self._on_liquidatable(addr, hf, None)
 
         tasks = [
             asyncio.create_task(self._block_watch_loop(), name="block_watch"),
@@ -908,8 +910,58 @@ class LiquidationPipelineV3:
             return
         # W9: PriceRegistry tracks staleness
         self.prices.update_price(asset, price)
-        # Delegate to HF engine for liquidation checks
+        # compute_hf() identifies candidates fast (0ms, no RPC); callback re-verifies
+        # from chain before acting — so the decision uses AccountData.health_factor.
         self.hf_engine.update_price(asset, price)
+
+    # ── HF-engine callback + on-chain re-verify ──────────────
+
+    def _hf_engine_price_trigger(self, address: str, hf_computed: float, pos) -> None:
+        """
+        HFEngine fires this when compute_hf() drops below 1.0 due to a price move.
+        We do NOT act on compute_hf directly. Instead, re-fetch AccountData.health_factor
+        from chain for this single address, then trigger only if confirmed liquidatable.
+        """
+        if not getattr(self, '_setup_complete', False):
+            return
+        asyncio.create_task(self._verify_and_trigger_from_loader(address, hf_computed))
+
+    async def _verify_and_trigger_from_loader(self, address: str, hf_computed: float) -> None:
+        """
+        Re-fetch getUserAccountData for one address, then use AccountData.health_factor
+        (not compute_hf) as the liquidation trigger. Logs discrepancy when they disagree.
+        """
+        if address in self._in_flight:
+            return
+        try:
+            await self.loader._batch_account_data([address])
+            acc = self.loader.get(address)
+            if acc is None:
+                return
+            if acc.is_liquidatable:
+                delta = abs(hf_computed - acc.hf_float)
+                logger.info(
+                    f"[PriceTrigger] {address[:10]}… onchain={acc.hf_float:.4f} "
+                    f"computed={hf_computed:.4f} delta={delta:.4f} → triggering"
+                )
+                self._on_liquidatable(address, acc.hf_float, None)
+            elif hf_computed < 1.0:
+                logger.debug(
+                    f"[HF-Diag] {address[:10]}… computed={hf_computed:.4f} "
+                    f"onchain={acc.hf_float:.4f} — on-chain not liquidatable (false trigger suppressed)"
+                )
+        except Exception as e:
+            logger.debug(f"[PriceTrigger] verify error {address[:10]}: {e}")
+
+    def _trigger_liquidatable_from_loader(self) -> None:
+        """
+        Scan AccountData.health_factor for all loader positions after each refresh_hot().
+        This is the block-cadence liquidation trigger — authoritative, same source as
+        getUserAccountData().
+        """
+        for addr, acc in list(self.loader._positions.items()):
+            if acc.is_liquidatable and addr not in self._in_flight:
+                self._on_liquidatable(addr, acc.hf_float, None)
 
     # ── Liquidation log handler (W3) ────────────────────────
 
@@ -1586,6 +1638,8 @@ class LiquidationPipelineV3:
                 # (Arbitrum ~250ms/block: 30 blocks≈7.5s, 120 blocks≈30s, 400 blocks≈100s)
                 if current % 30 == 0:
                     await self.loader.refresh_hot(hf_threshold=1.05)   # imminent only: ~2 req/s
+                    # Block-cadence trigger: fire on AccountData.health_factor, not compute_hf
+                    self._trigger_liquidatable_from_loader()
                 if current % 120 == 0:
                     await self.loader.refresh_hot(hf_threshold=1.15)   # near: ~0.5 req/s
                 if current % 400 == 0:
